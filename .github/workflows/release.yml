@@ -1,10 +1,18 @@
 name: release
 
-# 打 v* 标签时自动构建多架构静态二进制并发布 GitHub Release。
+# 两种触发方式：
+#   1) 推送 v* 标签自动发布；
+#   2) 手动触发 (workflow_dispatch) 并填入版本号，由 gh 在服务端创建标签与 Release。
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本标签，例如 v1.0.0'
+        required: true
+        default: 'v1.0.0'
 
 permissions:
   contents: write
@@ -24,10 +32,21 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Resolve version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "发布版本: ${TAG}"
+
       - name: Build binaries
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           # 内存马排查工具面向 Linux（读取 /proc），发布 amd64 与 arm64 两个架构
           for target in linux/amd64 linux/arm64; do
@@ -46,8 +65,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cat > notes.md <<'EOF'
-          ## MemCheck ${{ github.ref_name }}
+          # 去掉 YAML 块的 10 空格缩进，避免 markdown 把内容渲染成代码块
+          sed 's/^          //' > notes.md <<EOF
+          ## MemCheck ${TAG}
 
           内存马应急排查自动化工具 —— 依据《内存马应急排查手册 v2.0》实现的**只读**排查程序，
           一条命令完成 Java 进程/Agent、磁盘注入器、配置篡改、网络连接、JVM 运行时、
@@ -56,29 +76,32 @@ jobs:
           ### 特点
           - **零第三方依赖**：仅用 Go 标准库，单一静态二进制，适配 x86_64/ARM64 与断网环境。
           - **只读安全**：不删除文件、不杀进程、不重启服务，清除交由人工按手册处置。
-          - 原生读取 `/proc`、遍历文件系统、解析 `/proc/net/tcp`，不强依赖 ps/find/grep/netstat。
+          - 原生读取 \`/proc\`、遍历文件系统、解析 \`/proc/net/tcp\`，不强依赖 ps/find/grep/netstat。
 
           ### 下载
           | 文件 | 平台 |
           |------|------|
-          | `memcheck_linux_amd64` | Linux x86_64 |
-          | `memcheck_linux_arm64` | Linux ARM64 |
+          | \`memcheck_linux_amd64\` | Linux x86_64 |
+          | \`memcheck_linux_arm64\` | Linux ARM64 |
 
-          校验：`sha256sum -c SHA256SUMS`
+          校验：\`sha256sum -c SHA256SUMS\`
 
           ### 使用
-          ```bash
+          \`\`\`bash
           chmod +x memcheck_linux_amd64
           sudo ./memcheck_linux_amd64                 # 自动排查
           sudo ./memcheck_linux_amd64 -root /opt/tomcat -days 7
           sudo ./memcheck_linux_amd64 -json -o result.json
-          ```
+          \`\`\`
 
           > 仅用于授权范围内的应急响应与安全演练。
           EOF
-          gh release create "${GITHUB_REF_NAME}" \
+          # 若 Release 已存在则先删除（幂等，便于重跑）；标签由 gh 在服务端按需创建
+          gh release delete "${TAG}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "${TAG}" \
             dist/memcheck_linux_amd64 \
             dist/memcheck_linux_arm64 \
             dist/SHA256SUMS \
-            --title "MemCheck ${GITHUB_REF_NAME}" \
+            --target "${GITHUB_SHA}" \
+            --title "MemCheck ${TAG}" \
             --notes-file notes.md

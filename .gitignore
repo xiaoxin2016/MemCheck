@@ -3,3 +3,6 @@
 *.exe
 /lab/
 *.json
+
+# agent build artifacts (keep agent.jar committed)
+agent/build/

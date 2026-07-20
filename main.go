@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-var version = "1.0.0"
+var version = "1.1.0"
 
 func main() {
 	var (
@@ -33,6 +33,9 @@ func main() {
 		noNet    = flag.Bool("no-net", false, "跳过网络连接排查")
 		showVer  = flag.Bool("version", false, "打印版本并退出")
 		maxFile  = flag.Int64("max-file", 512*1024, "读取文件内容的单文件字节上限")
+		remove   = flag.Bool("remove", false, "热卸载模式：对运行时命中的已知内存马类，交互确认后尝试从内存移除")
+		rmClass  = flag.String("remove-class", "", "手工指定要卸载的类名（逗号分隔，隐含开启 -remove）")
+		assumeY  = flag.Bool("yes", false, "卸载时跳过交互确认（自动化场景，谨慎使用）")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -117,6 +120,17 @@ func main() {
 	progress(*jsonOut, "排查定时任务/启动项/SSH/SUID...")
 	checkPersistence(rep, roots, cfg)
 
+	// —— 阶段九：内存马热卸载（可选，需显式开启）——
+	rmOpt := removeOptions{
+		enabled:   *remove || *rmClass != "",
+		classes:   splitCSV(*rmClass),
+		assumeYes: *assumeY,
+	}
+	if rmOpt.enabled {
+		progress(*jsonOut, "内存马热卸载 (attach)...")
+		runRemoval(rep, procs, rmOpt)
+	}
+
 	// 输出
 	if *jsonOut {
 		if err := rep.printJSON(out); err != nil {
@@ -196,6 +210,13 @@ func usage() {
   -max-file int    单文件读取上限字节（默认 524288）
   -version         打印版本
 
+热卸载（危险操作，需显式开启；仅 Linux）:
+  -remove          对运行时命中的已知内存马类，交互确认后尝试从内存移除注册
+  -remove-class s  手工指定要卸载的类名（逗号分隔，隐含 -remove）
+  -yes             跳过交互确认（自动化场景，谨慎使用）
+  说明: 只在内存中移除 Filter/Servlet/Listener 注册，不删除磁盘文件、不重启服务。
+        卸载后务必再删除磁盘注入器与篡改配置，否则重启或再次访问会复活。建议 root 运行。
+
 退出码:
   0 未见异常  1 存在中/低危  2 存在高危/严重
 
@@ -203,5 +224,7 @@ func usage() {
   sudo ./memcheck
   sudo ./memcheck -root /opt/tomcat -days 7
   sudo ./memcheck -json -o /tmp/memcheck.json
+  sudo ./memcheck -remove                       # 扫描并交互式卸载命中的内存马
+  sudo ./memcheck -remove-class PlasmodesmaFilter -yes   # 定向卸载指定类
 `, version)
 }

@@ -25,6 +25,7 @@ Java 进程 / Agent 排查、磁盘注入器扫描、配置篡改检查、网络
 | 五/六 · 运行时检测 (24–43) | 调用 JDK `jstack`/`jmap`（若存在）在堆栈/直方图中搜索已知恶意类与代理线程；Arthas 需交互式，给出操作指引 |
 | 七 · 日志分析 (44–48) | 定位并分析 access log / catalina.out：WebSocket 升级请求、可疑 POST、类加载异常 |
 | 八/九 · 持久化 (49–58) | crontab / cron.d / systemd / rc.local、启动脚本中的 `-javaagent`、`authorized_keys`、非标准目录 SUID |
+| 四 · 内存马热卸载 (59–65) | **可选、需显式开启**：attach 到运行中 JVM，交互确认后从内存移除恶意 Filter/Servlet/Listener 注册（手册 OGNL 热清除的自动化版） |
 
 内置已知内存马特征库（冰蝎 `EdwardsiidaeFilter`、哥斯拉 `PlasmodesmaFilter` 及 5 个载荷组件、
 代理马 `Prepupa`）与常见框架 Filter/Servlet 白名单（Spring / Shiro / Druid / Tomcat / Resin），
@@ -32,7 +33,10 @@ Java 进程 / Agent 排查、磁盘注入器扫描、配置篡改检查、网络
 
 ## 构建
 
+仓库已包含预编译的 `agent/agent.jar`，直接 `go build` 即可。若修改了 agent 源码，需用 JDK 重新构建：
+
 ```bash
+sh agent/build.sh        # 需要 javac/jar，产出 agent/agent.jar（供 go:embed 内嵌）
 go build -o memcheck .
 
 # 交叉编译（现场为 ARM64 时在本机编好拷过去）
@@ -77,6 +81,48 @@ sudo ./memcheck -full
 - `2`：存在高危/严重发现
 
 便于在编排/巡检脚本中直接判断。
+
+## 内存马热卸载（危险操作，需显式开启，仅 Linux）
+
+对应手册第四节「内存马清除操作」的自动化版本：在**不重启服务**的前提下，从运行中的 JVM
+内存里移除恶意组件的注册（Filter / Servlet / Listener），等价于手册 [62][63] 的 Arthas OGNL
+热清除。
+
+```bash
+# 自动：扫描运行时命中的已知内存马类，逐个请求确认后卸载（默认推荐“有风险的”已注册类）
+sudo ./memcheck -remove
+
+# 定向：手工指定要卸载的类名，跳过确认（自动化场景）
+sudo ./memcheck -remove-class PlasmodesmaFilter,EdwardsiidaeFilter -yes
+```
+
+参数：
+
+| 参数 | 说明 |
+|------|------|
+| `-remove` | 开启热卸载。自动扫描每个 JVM，命中已知内存马类时请求确认 |
+| `-remove-class s` | 手工指定类名（逗号分隔），隐含 `-remove` |
+| `-yes` | 跳过交互确认（谨慎使用；非交互式环境下不加 `-yes` 一律跳过卸载） |
+
+**实现方式**：卸载能力由一个自研 Java agent（`agent/MemCheckAgent.java`）提供，编译为
+`agent.jar` 后通过 `go:embed` **静态内嵌进单一二进制**；运行时释放到临时文件，用**纯 Go 实现的
+HotSpot attach 协议**（无 cgo，`.attach_pid` + `SIGQUIT` + Unix socket）加载进目标 JVM，
+agent 通过反射发现 Tomcat `StandardContext` 并移除恶意 `FilterDef`/`FilterMap`/`filterConfig`
+等注册项，再把结果回写供主程序解析。整个过程不落地依赖 JDK、不需要 Arthas。
+
+**安全模型（务必了解）**：
+
+- 默认关闭，必须显式 `-remove` 才会有任何写操作；非交互环境不加 `-yes` 一律跳过。
+- 只在**内存**中移除注册，**不删除磁盘文件、不杀进程、不重启服务**。
+- 自动模式只推荐**已确认命中**的已知内存马类；其余可疑项仍只报告不处置。
+- **热卸载不是终点**：磁盘上的注入器 JSP / 篡改的 web.xml / 恶意 `-javaagent` 若不清除，
+  重启或再次访问后内存马会复活。卸载后请务必按报告删除磁盘注入器与配置、并排查入侵入口。
+- 容器场景：目标 JVM 若在独立命名空间（容器）中，需在该容器内运行本工具，程序会明确提示。
+- 建议以 root 运行；非 root 时只能 attach 到同属主的 JVM。
+
+**支持范围**：主要覆盖 Tomcat / Spring Boot 内嵌 Tomcat 的 Filter/Servlet/Listener 型内存马。
+其它容器（Resin/Jetty/Undertow）或 Agent 型、Valve 型可能无法热卸载，此时程序会报告类已加载
+但无注册项可卸载，提示重启清除并排查持久化。生产环境首次使用建议先在同版本测试环境验证。
 
 ## 输出说明
 

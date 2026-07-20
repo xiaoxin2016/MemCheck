@@ -1,0 +1,5 @@
+/memcheck
+/memcheck-*
+*.exe
+/lab/
+*.json

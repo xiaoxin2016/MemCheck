@@ -30,7 +30,18 @@ type agentResult struct {
 	ContextsFound int         `json:"contextsFound"`
 	Action        string      `json:"action"`
 	Error         string      `json:"error"`
-	Results       []agentItem `json:"results"`
+	Inventory     []invItem   `json:"inventory"` // action=list 返回的已注册组件清单
+	Results       []agentItem `json:"results"`   // action=remove 返回的处置结果
+}
+
+// invItem 一条已注册组件（Filter/Servlet/Listener）
+type invItem struct {
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+	Class      string `json:"class"`
+	CodeSource string `json:"codeSource"` // 类的 codeSource 位置；内存注入通常为空
+	Loader     string `json:"loader"`     // 加载该类的 classloader 类型
+	Resolved   bool   `json:"resolved"`   // 是否成功解析到 Class（拿到 codeSource）
 }
 
 type agentItem struct {
@@ -38,6 +49,47 @@ type agentItem struct {
 	Status       string `json:"status"`
 	RegisteredAs string `json:"registeredAs"`
 	Detail       string `json:"detail"`
+}
+
+// classifyComponent 用 Go 侧统一启发式判定一条已注册组件的风险，返回等级与原因。
+// 关键信号是 codeSource：内存注入(反序列化/defineClass)的类通常 codeSource 为空，
+// 而正常应用/框架的组件 codeSource 指向其 jar——这样即使内存马类名/包名完全正常也能被发现，
+// 且不会误伤有正常 codeSource 的业务过滤器。对应手册对 codeSource 的研判逻辑。
+func classifyComponent(it invItem) (sev Severity, reason string, candidate bool) {
+	// 已知内存马特征（类名或注册名命中）→ 最高优先
+	if d, ok := matchKnownMalware(it.Class); ok {
+		return SevCritical, "命中已知内存马特征: " + d, true
+	}
+	if it.Name != "" {
+		if d, ok := matchKnownMalware(it.Name); ok {
+			return SevCritical, "注册名命中已知内存马特征: " + d, true
+		}
+	}
+	// 框架/JDK 内部 → 正常，跳过
+	if isTrustedClassName(it.Class) || isWhitelistedFilter(it.Class) {
+		return SevInfo, "", false
+	}
+	// codeSource 为空 + 已成功解析到类 → 极可能是内存注入（defineClass 无 ProtectionDomain）
+	if it.Resolved && it.CodeSource == "" {
+		return SevCritical, "codeSource 为空，疑似内存注入(反序列化/defineClass)", true
+	}
+	// codeSource 指向 JSP → JSP 注入器编译加载
+	if strings.Contains(strings.ToLower(it.CodeSource), ".jsp") {
+		return SevCritical, "codeSource 指向 JSP，疑似 JSP 注入器加载", true
+	}
+	// 类名启发式（无包名 / 生僻词+组件后缀 / 包名异常）
+	if r, susp := looksSuspiciousClassName(it.Class); susp {
+		return SevHigh, r, true
+	}
+	// Lambda 伪装
+	if strings.Contains(it.Class, "$$Lambda$") && !isTrustedClassName(it.Class) {
+		return SevHigh, "Lambda 表达式伪装的 " + it.Kind, true
+	}
+	// 类无法解析（可能已被隐藏）→ 提示但不自动卸载
+	if !it.Resolved {
+		return SevLow, "无法解析该类(可能已卸载/隐藏)", false
+	}
+	return SevInfo, "", false
 }
 
 // knownMalwareNames 返回已知内存马类名列表（作为自动扫描/推荐的目标集合）。
@@ -90,30 +142,21 @@ func processOne(rep *Report, p JavaProcess, jarPath string, opt removeOptions) {
 
 	var candidates []string
 	if len(opt.classes) > 0 {
-		// 手工指定：直接作为候选
+		// 手工指定：直接作为候选，跳过枚举
 		candidates = opt.classes
 	} else {
-		// 自动模式：先 scan 发现已加载/已注册的已知内存马类
-		res, err := runAgent(p.PID, jarPath, "scan", knownMalwareNames())
+		// 自动模式：枚举全部已注册组件，用 Go 侧启发式挑出可疑项（不依赖硬编码类名）
+		res, err := runAgent(p.PID, jarPath, "list", nil)
 		if err != nil {
-			rep.addf(SevMedium, removePhase, "remove", "PID "+pidStr+" 扫描失败", err.Error(),
+			rep.addf(SevMedium, removePhase, "remove", "PID "+pidStr+" 运行时枚举失败", err.Error(),
 				"确认目标为 HotSpot JVM 且权限足够。")
 			return
 		}
-		reportScan(rep, p, res)
-		// 推荐卸载“有风险的”——即在注册表中命中的（status=found）
-		for _, it := range res.Results {
-			if it.Status == "found" {
-				candidates = append(candidates, it.Class)
-			}
-		}
-		candidates = dedupStrings(candidates)
+		candidates = reportInventory(rep, p, res)
 	}
 
 	if len(candidates) == 0 {
-		rep.addf(SevInfo, removePhase, "remove", "PID "+pidStr+" 未发现可热卸载的已注册内存马类",
-			"", "若确认存在内存马但此处未命中，可用 -remove-class 手工指定类名，或用 Arthas 复核。")
-		return
+		return // reportInventory 已给出说明
 	}
 
 	// 交互确认（-yes 跳过）
@@ -121,7 +164,7 @@ func processOne(rep *Report, p JavaProcess, jarPath string, opt removeOptions) {
 		if !confirmRemoval(p, candidates) {
 			rep.note("PID %d 用户取消卸载。", p.PID)
 			rep.addf(SevInfo, removePhase, "remove", "PID "+pidStr+" 已跳过卸载（用户取消/非交互）",
-				strings.Join(candidates, ", "), "如需卸载请加 -yes 或重新运行确认。")
+				strings.Join(candidates, ", "), "如需卸载请加 -yes，或重新运行确认。")
 			return
 		}
 	}
@@ -136,23 +179,78 @@ func processOne(rep *Report, p JavaProcess, jarPath string, opt removeOptions) {
 	reportRemoval(rep, p, res)
 }
 
-func reportScan(rep *Report, p JavaProcess, res *agentResult) {
+// reportInventory 报告枚举到的组件清单，标记可疑项，返回推荐卸载的类名列表。
+func reportInventory(rep *Report, p JavaProcess, res *agentResult) []string {
 	pidStr := strconv.Itoa(p.PID)
 	if res.Error != "" {
-		rep.note("PID %d agent 扫描内部错误: %s", p.PID, res.Error)
+		rep.note("PID %d agent 枚举内部错误: %s", p.PID, res.Error)
 	}
-	for _, it := range res.Results {
-		switch it.Status {
-		case "found":
-			rep.addf(SevCritical, removePhase, "remove",
-				"PID "+pidStr+" 运行时命中内存马: "+it.Class,
-				it.RegisteredAs, "建议卸载（下方将请求确认）。")
-		case "loaded_not_registered":
-			rep.addf(SevHigh, removePhase, "remove",
-				"PID "+pidStr+" 加载了内存马类但未在注册表中: "+it.Class,
-				it.Detail, "无法热卸载注册项，重启可清除；务必同时排查磁盘注入器与漏洞入口。")
+	if res.ContextsFound == 0 {
+		rep.addf(SevMedium, removePhase, "remove",
+			"PID "+pidStr+" attach 成功但未发现 Tomcat 上下文",
+			"", "可能是非 Tomcat 容器(Resin/Jetty/Undertow)或 context 尚未启动；改用 Arthas 复核。")
+		return nil
+	}
+
+	var candidates []string
+	seen := map[string]bool{}
+	suspicious := 0
+	filters, servlets, listeners := 0, 0, 0
+	for _, it := range res.Inventory {
+		switch it.Kind {
+		case "filter":
+			filters++
+		case "servlet":
+			servlets++
+		case "listener":
+			listeners++
+		}
+		sev, reason, cand := classifyComponent(it)
+		if cand {
+			suspicious++
+			where := it.Kind
+			if it.Name != "" {
+				where += ":" + it.Name
+			}
+			rep.addf(sev, removePhase, "remove",
+				"PID "+pidStr+" 运行时发现可疑"+it.Kind+": "+it.Class,
+				where+" -> "+it.Class+"  ("+reason+")",
+				"疑似内存马，下方将请求确认后热卸载。")
+			if it.Class != "" && !seen[it.Class] {
+				seen[it.Class] = true
+				candidates = append(candidates, it.Class)
+			}
 		}
 	}
+
+	// 概览 + 完整 filter 类名清单（等价 Arthas sc -d *Filter*，便于人工核对/手工 -remove-class）
+	rep.addf(SevInfo, removePhase, "remove",
+		fmt.Sprintf("PID %s 运行时组件枚举: 上下文 %d，Filter %d/Servlet %d/Listener %d，可疑 %d",
+			pidStr, res.ContextsFound, filters, servlets, listeners, suspicious),
+		inventoryList(res.Inventory),
+		"若确有内存马但未被自动判定，可用 -remove-class <类名> 手工指定卸载。")
+
+	return candidates
+}
+
+func inventoryList(inv []invItem) string {
+	var b strings.Builder
+	for _, it := range inv {
+		name := it.Name
+		if name == "" {
+			name = "-"
+		}
+		cs := it.CodeSource
+		if cs == "" {
+			cs = "codeSource=空"
+		}
+		fmt.Fprintf(&b, "\n  [%s] %s : %s  (%s)", it.Kind, name, it.Class, cs)
+	}
+	s := b.String()
+	if len(s) > 4000 {
+		s = s[:4000] + "\n  …(清单过长已截断)"
+	}
+	return strings.TrimPrefix(s, "\n")
 }
 
 func reportRemoval(rep *Report, p JavaProcess, res *agentResult) {

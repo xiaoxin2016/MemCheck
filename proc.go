@@ -226,6 +226,10 @@ func checkDeletedFDs(rep *Report, phase string, pid int) {
 		if target == "" {
 			continue
 		}
+		// 跳过本工具自身释放的临时 agent/结果文件（attach 后删除，JVM 仍持句柄），避免自我误报
+		if strings.Contains(target, ".memcheck-agent-") || strings.Contains(target, ".memcheck-res-") {
+			continue
+		}
 		if strings.Contains(target, "(deleted)") &&
 			(strings.HasSuffix(strings.TrimSuffix(target, " (deleted)"), ".jar") ||
 				strings.HasSuffix(strings.TrimSuffix(target, " (deleted)"), ".class")) {

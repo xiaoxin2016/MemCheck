@@ -127,6 +127,26 @@ func FrameworkWhitelistSet() []string {
 	return frameworkWhitelistCache
 }
 
+// TrustedClassPrefixes JDK/框架内部包前缀（这些包下的类不判为内存马，避免误报）。
+var TrustedClassPrefixes = []string{
+	"java.", "javax.", "jakarta.", "sun.", "com.sun.", "jdk.", "oracle.",
+	"org.apache.catalina", "org.apache.coyote", "org.apache.tomcat", "org.apache.jasper",
+	"org.springframework", "org.springframework.boot",
+	"com.caucho", "org.apache.shiro", "org.eclipse.jetty", "io.undertow",
+	"com.alibaba.druid", "org.apache.commons", "ch.qos.logback", "org.slf4j",
+	"org.apache.logging", "com.fasterxml", "io.micrometer", "org.hibernate",
+}
+
+// isTrustedClassName 判断类是否属于 JDK/框架内部（可信，不判为内存马）。
+func isTrustedClassName(fqcn string) bool {
+	for _, p := range TrustedClassPrefixes {
+		if strings.HasPrefix(fqcn, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // looksSuspiciousClassName 通用启发式: 无包名 / Lambda 伪装 / 生僻词 + 组件后缀。
 func looksSuspiciousClassName(fqcn string) (reason string, suspicious bool) {
 	name := fqcn
@@ -135,9 +155,14 @@ func looksSuspiciousClassName(fqcn string) (reason string, suspicious bool) {
 		pkg = fqcn[:i]
 		name = fqcn[i+1:]
 	}
+	// JDK/框架内部类一律可信（如 sun.misc.ObjectInputFilter$Config$$Lambda$ 等）
+	if isTrustedClassName(fqcn) {
+		return "", false
+	}
 	if isWhitelistedFilter(fqcn) {
 		return "", false
 	}
+	// 仅当 Lambda 且看起来是组件（或无包名）时才判可疑，避免误报 JDK 内部 lambda
 	if strings.Contains(fqcn, "$$Lambda$") {
 		return "$$Lambda$ 结尾，疑似 Lambda 表达式伪装的 Filter", true
 	}

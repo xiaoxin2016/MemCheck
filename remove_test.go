@@ -5,6 +5,46 @@ import (
 	"testing"
 )
 
+func TestClassifyComponent(t *testing.T) {
+	cases := []struct {
+		name      string
+		it        invItem
+		candidate bool
+	}{
+		{"内存注入(codeSource空)", invItem{Kind: "filter", Name: "evil", Class: "com.company.web.InjectedFilter", CodeSource: "", Resolved: true}, true},
+		{"正常应用过滤器(有codeSource)", invItem{Kind: "filter", Name: "auth", Class: "com.company.web.AuthFilter", CodeSource: "file:/app/app.jar", Resolved: true}, false},
+		{"框架过滤器", invItem{Kind: "filter", Name: "enc", Class: "org.springframework.web.filter.CharacterEncodingFilter", CodeSource: "", Resolved: true}, false},
+		{"已知内存马", invItem{Kind: "filter", Name: "x", Class: "org.apache.PlasmodesmaFilter", CodeSource: "file:/x.jar", Resolved: true}, true},
+		{"codeSource指向JSP", invItem{Kind: "filter", Name: "y", Class: "com.app.ShellFilter", CodeSource: "file:/webapps/ROOT/shell.jsp", Resolved: true}, true},
+		{"无包名组件", invItem{Kind: "filter", Name: "z", Class: "CmdFilter", CodeSource: "file:/x.jar", Resolved: true}, true},
+	}
+	for _, c := range cases {
+		_, reason, cand := classifyComponent(c.it)
+		if cand != c.candidate {
+			t.Errorf("%s: classifyComponent candidate=%v want %v (reason=%q)", c.name, cand, c.candidate, reason)
+		}
+	}
+}
+
+func TestTrustedLambdaNotSuspicious(t *testing.T) {
+	// JDK 内部 lambda 不应被判为可疑（修复 sun.misc.ObjectInputFilter$Config$$Lambda 误报）
+	jdk := []string{
+		"sun.misc.ObjectInputFilter$Config$$Lambda$500/767648390",
+		"java.util.stream.Collectors$$Lambda$1/0x0000",
+		"org.springframework.boot.web.filter.OrderedFormContentFilter$$Lambda$2",
+	}
+	for _, s := range jdk {
+		if _, ok := looksSuspiciousClassName(s); ok {
+			t.Errorf("looksSuspiciousClassName(%q) = true, want false (JDK/framework internal)", s)
+		}
+	}
+	// 但业务包下的 Lambda 伪装 Filter 仍应可疑
+	if _, ok := looksSuspiciousClassName("com.evil.Shell$$Lambda$1"); !ok {
+		// looksSuspiciousClassName 对 $$Lambda$ 直接判可疑（非受信包）
+		t.Errorf("com.evil lambda should be suspicious")
+	}
+}
+
 func TestParseAgentResult(t *testing.T) {
 	// 与 MemCheckAgent 实际回写格式一致的样本
 	sample := `{"contextsFound":1,"action":"remove","results":[` +

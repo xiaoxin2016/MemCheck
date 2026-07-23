@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -12,56 +13,60 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * MemCheckAgent —— 由 MemCheck 通过 JVM attach 加载的内存马卸载 agent。
+ * MemCheckAgent —— 由 MemCheck 通过 JVM attach 加载的内存马枚举/卸载 agent。
  *
- * 只在内存中移除恶意组件的注册（Filter/Servlet/Listener），不删除磁盘文件、不重启服务，
- * 对应《内存马应急排查手册 v2.0》第[62][63]条 Arthas OGNL 热清除的自动化版本。
+ * 设计要点：
+ *   - action=list  ：枚举所有 Tomcat 上下文中已注册的 Filter/Servlet/Listener（名称+类名），
+ *                     不做任何判断，交由 Go 侧用统一启发式判定是否可疑。这样即使内存马类名未知，
+ *                     也能通过“它出现在过滤器链里”被发现（应对反序列化一次性注入的内存马）。
+ *   - action=remove：按传入的类名/名称匹配，移除对应注册项。
  *
- * agentArgs 形如: action=scan|remove;result=/tmp/xx.json;classes=EdwardsiidaeFilter,PlasmodesmaFilter
- *   action  scan=仅报告命中；remove=报告并尝试移除
- *   result  结果 JSON 写入路径（供 Go 侧读取）
- *   classes 逗号分隔的目标类名（简单名或全限定名，子串匹配）
+ * 上下文发现：遍历 Instrumentation.getAllLoadedClasses() 收集所有 ClassLoader，找出 WebappClassLoaderBase
+ * （含 Spring Boot 内嵌 Tomcat 的 TomcatEmbeddedWebappClassLoader），经 getResources().getContext()
+ * 拿到 StandardContext——不依赖是否有活跃请求线程，兼容独立 Tomcat 与 Spring Boot 内嵌 Tomcat。
  *
- * 通过反射操作 Tomcat 内部类，不在编译期依赖 servlet/Tomcat，任何一步失败都被捕获且不影响其它类。
+ * 全程反射操作、编译期不依赖 servlet/Tomcat；任何一步失败都被捕获且不影响其它项。
+ *
+ * agentArgs: action=list|remove;result=/tmp/xx.json;classes=a,b,c
  */
 public class MemCheckAgent {
 
     public static void agentmain(String agentArgs, Instrumentation inst) {
         Map<String, String> opts = parseArgs(agentArgs);
-        String action = opts.getOrDefault("action", "scan");
+        String action = opts.getOrDefault("action", "list");
         String resultPath = opts.get("result");
         List<String> targets = splitList(opts.get("classes"));
 
         StringBuilder json = new StringBuilder();
-        List<String> items = new ArrayList<>();
-        int contextsFound = 0;
         String err = null;
+        int contextsFound = 0;
+        List<String> inventory = new ArrayList<>();
+        List<String> results = new ArrayList<>();
 
         try {
-            boolean remove = "remove".equalsIgnoreCase(action);
-            Set<Object> contexts = findStandardContexts();
+            Set<Object> contexts = findStandardContexts(inst);
             contextsFound = contexts.size();
 
-            // 逐个目标类，统计其加载状态（是否已加载到 JVM）
-            Map<String, Boolean> loaded = loadedClasses(inst, targets);
-
-            // 对每个 Tomcat context 处理 filter/servlet/listener
-            Map<String, String> handled = new LinkedHashMap<>(); // 已在注册表中处理的目标 -> 结果描述
-            for (Object ctx : contexts) {
-                handleFilters(ctx, targets, remove, handled, items);
-                handleServlets(ctx, targets, remove, handled, items);
-                handleListeners(ctx, targets, remove, handled, items);
-            }
-
-            // 目标类已加载但未在任何注册表中命中：属载荷类/其它容器，建议重启
-            for (String t : targets) {
-                if (!handledContains(handled, t)) {
-                    boolean isLoaded = anyLoaded(loaded, t);
-                    String status = isLoaded ? "loaded_not_registered" : "not_found";
-                    String detail = isLoaded
-                            ? "类已加载但未在 Tomcat Filter/Servlet/Listener 注册表中找到；可能是载荷类或非 Tomcat 容器，重启可清除"
-                            : "未在当前 JVM 中发现该类";
-                    items.add(resultItem(t, status, "", detail));
+            if ("remove".equalsIgnoreCase(action)) {
+                Map<String, String> handled = new LinkedHashMap<>();
+                for (Object ctx : contexts) {
+                    handleFilters(ctx, targets, handled, results);
+                    handleServlets(ctx, targets, handled, results);
+                    handleListeners(ctx, targets, handled, results);
+                }
+                Map<String, Boolean> loaded = loadedClasses(inst, targets);
+                for (String t : targets) {
+                    if (!handled.containsKey(t)) {
+                        boolean isLoaded = Boolean.TRUE.equals(loaded.get(t));
+                        results.add(resultItem(t, isLoaded ? "loaded_not_registered" : "not_found", "",
+                                isLoaded ? "类已加载但未在注册表中找到；重启可清除，务必排查磁盘注入器/漏洞入口"
+                                         : "未在当前 JVM 中发现该类"));
+                    }
+                }
+            } else {
+                // list：枚举所有已注册组件
+                for (Object ctx : contexts) {
+                    enumerate(ctx, inventory);
                 }
             }
         } catch (Throwable t) {
@@ -70,15 +75,9 @@ public class MemCheckAgent {
 
         json.append("{\"contextsFound\":").append(contextsFound)
             .append(",\"action\":\"").append(esc(action)).append("\"");
-        if (err != null) {
-            json.append(",\"error\":\"").append(esc(err)).append("\"");
-        }
-        json.append(",\"results\":[");
-        for (int i = 0; i < items.size(); i++) {
-            if (i > 0) json.append(",");
-            json.append(items.get(i));
-        }
-        json.append("]}");
+        if (err != null) json.append(",\"error\":\"").append(esc(err)).append("\"");
+        json.append(",\"inventory\":[").append(join(inventory)).append("]");
+        json.append(",\"results\":[").append(join(results)).append("]}");
 
         String out = json.toString();
         if (resultPath != null) {
@@ -90,18 +89,33 @@ public class MemCheckAgent {
         System.out.println("[MemCheckAgent] " + out);
     }
 
-    // ---- Tomcat context 发现 ----
+    // ---- 上下文发现（兼容独立/内嵌 Tomcat）----
 
-    private static Set<Object> findStandardContexts() {
-        Set<Object> set = java.util.Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
-        Set<Thread> threads = Thread.getAllStackTraces().keySet();
-        for (Thread th : threads) {
-            try {
-                collectFromLoader(th.getContextClassLoader(), set);
-            } catch (Throwable ignore) {
+    private static Set<Object> findStandardContexts(Instrumentation inst) {
+        Set<Object> ctxs = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        Set<ClassLoader> loaders = Collections.newSetFromMap(new IdentityHashMap<ClassLoader, Boolean>());
+
+        // 1) 从所有已加载类的 ClassLoader 中找 webapp 加载器（最稳，不依赖活跃线程）
+        try {
+            for (Class<?> c : inst.getAllLoadedClasses()) {
+                ClassLoader cl = c.getClassLoader();
+                if (cl != null) loaders.add(cl);
             }
+        } catch (Throwable ignore) {
         }
-        return set;
+        // 2) 线程 contextClassLoader 兜底
+        try {
+            for (Thread th : Thread.getAllStackTraces().keySet()) {
+                ClassLoader cl = th.getContextClassLoader();
+                if (cl != null) loaders.add(cl);
+            }
+        } catch (Throwable ignore) {
+        }
+
+        for (ClassLoader cl : loaders) {
+            collectFromLoader(cl, ctxs);
+        }
+        return ctxs;
     }
 
     private static void collectFromLoader(ClassLoader cl, Set<Object> set) {
@@ -133,40 +147,146 @@ public class MemCheckAgent {
     private static boolean isStandardContext(Class<?> c) {
         for (Class<?> k = c; k != null; k = k.getSuperclass()) {
             String n = k.getName();
-            if (n.endsWith("StandardContext") || n.equals("org.apache.catalina.core.StandardContext")) return true;
+            if (n.endsWith("StandardContext")) return true;
         }
-        // 通过是否具备关键方法判断（兼容不同版本/包装）
         return hasMethod(c, "findFilterDefs") && hasMethod(c, "removeFilterDef");
     }
 
-    // ---- Filter ----
+    // ---- 枚举（list）----
 
-    private static void handleFilters(Object ctx, List<String> targets, boolean remove,
+    private static void enumerate(Object ctx, List<String> out) {
+        ClassLoader webappCl = webappLoaderOf(ctx);
+        // Filter
+        try {
+            Object defs = invoke(ctx, "findFilterDefs");
+            if (defs instanceof Object[]) {
+                for (Object def : (Object[]) defs) {
+                    String cls = str(invoke(def, "getFilterClass"));
+                    Class<?> k = resolveClass(webappCl, cls, filterInstance(ctx, str(invoke(def, "getFilterName"))));
+                    out.add(invItem("filter", str(invoke(def, "getFilterName")), cls, k));
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        // Servlet（Wrapper 子容器）
+        try {
+            Object children = invoke(ctx, "findChildren");
+            if (children instanceof Object[]) {
+                for (Object w : (Object[]) children) {
+                    if (!hasMethod(w.getClass(), "getServletClass")) continue;
+                    String scls = str(invoke(w, "getServletClass"));
+                    if (scls == null) continue;
+                    out.add(invItem("servlet", str(invoke(w, "getName")), scls, resolveClass(webappCl, scls, null)));
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        // Listener
+        enumerateListeners(ctx, "getApplicationEventListeners", out);
+        enumerateListeners(ctx, "getApplicationLifecycleListeners", out);
+    }
+
+    private static void enumerateListeners(Object ctx, String getter, List<String> out) {
+        try {
+            Object arr = invoke(ctx, getter);
+            if (arr instanceof Object[]) {
+                for (Object l : (Object[]) arr) {
+                    if (l != null) out.add(invItem("listener", "", l.getClass().getName(), l.getClass()));
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+    }
+
+    // webappLoaderOf 取上下文的 webapp 类加载器（用于按类名解析组件 Class 以获取 codeSource）。
+    private static ClassLoader webappLoaderOf(Object ctx) {
+        try {
+            Object loader = invoke(ctx, "getLoader");
+            if (loader != null) {
+                Object cl = invoke(loader, "getClassLoader");
+                if (cl instanceof ClassLoader) return (ClassLoader) cl;
+            }
+        } catch (Throwable ignore) {
+        }
+        return ctx.getClass().getClassLoader();
+    }
+
+    // filterInstance 从 filterConfigs 里取已实例化的 filter（不触发新实例化），拿不到返回 null。
+    private static Object filterInstance(Object ctx, String fname) {
+        try {
+            Field f = findField(ctx.getClass(), "filterConfigs");
+            if (f == null) return null;
+            f.setAccessible(true);
+            Object m = f.get(ctx);
+            if (m instanceof Map) {
+                Object cfg = ((Map) m).get(fname);
+                if (cfg != null) {
+                    Field ff = findField(cfg.getClass(), "filter");
+                    if (ff != null) {
+                        ff.setAccessible(true);
+                        return ff.get(cfg);
+                    }
+                }
+            }
+        } catch (Throwable ignore) {
+        }
+        return null;
+    }
+
+    private static Class<?> resolveClass(ClassLoader cl, String className, Object instance) {
+        if (instance != null) return instance.getClass();
+        if (className == null || cl == null) return null;
+        try {
+            return Class.forName(className, false, cl); // 已加载则直接返回，不触发静态初始化
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    // codeSourceOf 返回类的 codeSource 位置；内存注入(defineClass 无 ProtectionDomain)通常为空。
+    private static String codeSourceOf(Class<?> k) {
+        if (k == null) return "";
+        try {
+            java.security.ProtectionDomain pd = k.getProtectionDomain();
+            if (pd == null) return "";
+            java.security.CodeSource cs = pd.getCodeSource();
+            if (cs == null || cs.getLocation() == null) return "";
+            return cs.getLocation().toString();
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    private static String loaderNameOf(Class<?> k) {
+        if (k == null) return "";
+        try {
+            ClassLoader cl = k.getClassLoader();
+            return cl == null ? "bootstrap" : cl.getClass().getName();
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    // ---- 移除（remove）----
+
+    private static void handleFilters(Object ctx, List<String> targets,
                                       Map<String, String> handled, List<String> items) {
         try {
             Object defsObj = invoke(ctx, "findFilterDefs");
             if (!(defsObj instanceof Object[])) return;
-            Object[] defs = (Object[]) defsObj;
-            for (Object def : defs) {
+            for (Object def : (Object[]) defsObj) {
                 String fclass = str(invoke(def, "getFilterClass"));
                 String fname = str(invoke(def, "getFilterName"));
                 String match = matchAny(targets, fclass, fname);
                 if (match == null) continue;
 
                 String registeredAs = "filter:" + fname + " -> " + fclass;
-                if (!remove) {
-                    items.add(resultItem(match, "found", registeredAs, "命中 Filter 注册（scan 模式未移除）"));
-                    handled.put(match, "found");
-                    continue;
-                }
-                String detail;
                 String status = "removed";
+                String detail;
                 try {
                     ClassLoader ccl = ctx.getClass().getClassLoader();
-                    // 移除 FilterDef
                     Class<?> filterDefCls = ccl.loadClass("org.apache.tomcat.util.descriptor.web.FilterDef");
                     invoke1(ctx, "removeFilterDef", filterDefCls, def);
-                    // 移除对应 FilterMap
                     int mapsRemoved = 0;
                     Object mapsObj = invoke(ctx, "findFilterMaps");
                     if (mapsObj instanceof Object[]) {
@@ -178,7 +298,6 @@ public class MemCheckAgent {
                             }
                         }
                     }
-                    // 移除并释放 filterConfigs 缓存
                     boolean cfgReleased = releaseFilterConfig(ctx, fname);
                     detail = "已移除 FilterDef，FilterMap x" + mapsRemoved + (cfgReleased ? "，已释放 filterConfig" : "");
                 } catch (Throwable e) {
@@ -210,30 +329,23 @@ public class MemCheckAgent {
         return false;
     }
 
-    // ---- Servlet ----
-
-    private static void handleServlets(Object ctx, List<String> targets, boolean remove,
+    private static void handleServlets(Object ctx, List<String> targets,
                                        Map<String, String> handled, List<String> items) {
         try {
             Object childrenObj = invoke(ctx, "findChildren");
             if (!(childrenObj instanceof Object[])) return;
             for (Object w : (Object[]) childrenObj) {
+                if (!hasMethod(w.getClass(), "getServletClass")) continue;
                 String sclass = str(invoke(w, "getServletClass"));
                 String sname = str(invoke(w, "getName"));
                 String match = matchAny(targets, sclass);
                 if (match == null) continue;
                 String registeredAs = "servlet:" + sname + " -> " + sclass;
-                if (!remove) {
-                    items.add(resultItem(match, "found", registeredAs, "命中 Servlet 注册（scan 模式未移除）"));
-                    handled.put(match, "found");
-                    continue;
-                }
                 String status = "removed";
                 String detail;
                 try {
                     ClassLoader ccl = ctx.getClass().getClassLoader();
                     Class<?> containerCls = ccl.loadClass("org.apache.catalina.Container");
-                    // 先移除 servlet 映射
                     int mapRemoved = 0;
                     Object patternsObj = invoke(ctx, "findServletMappings");
                     if (patternsObj instanceof String[]) {
@@ -258,17 +370,15 @@ public class MemCheckAgent {
         }
     }
 
-    // ---- Listener ----
-
-    private static void handleListeners(Object ctx, List<String> targets, boolean remove,
+    private static void handleListeners(Object ctx, List<String> targets,
                                         Map<String, String> handled, List<String> items) {
-        handleListenerArray(ctx, targets, remove, handled, items,
+        handleListenerArray(ctx, targets, handled, items,
                 "getApplicationEventListeners", "setApplicationEventListeners", "event");
-        handleListenerArray(ctx, targets, remove, handled, items,
+        handleListenerArray(ctx, targets, handled, items,
                 "getApplicationLifecycleListeners", "setApplicationLifecycleListeners", "lifecycle");
     }
 
-    private static void handleListenerArray(Object ctx, List<String> targets, boolean remove,
+    private static void handleListenerArray(Object ctx, List<String> targets,
                                             Map<String, String> handled, List<String> items,
                                             String getter, String setter, String kind) {
         try {
@@ -276,25 +386,18 @@ public class MemCheckAgent {
             if (!(arrObj instanceof Object[])) return;
             Object[] arr = (Object[]) arrObj;
             List<Object> keep = new ArrayList<>();
-            List<String> removedClasses = new ArrayList<>();
+            List<String[]> removed = new ArrayList<>();
             for (Object l : arr) {
-                if (l == null) { continue; }
+                if (l == null) continue;
                 String cn = l.getClass().getName();
                 String match = matchAny(targets, cn);
                 if (match != null) {
-                    if (!remove) {
-                        items.add(resultItem(match, "found", "listener(" + kind + "):" + cn,
-                                "命中 Listener 注册（scan 模式未移除）"));
-                        handled.put(match, "found");
-                        keep.add(l);
-                    } else {
-                        removedClasses.add(match + "|" + cn);
-                    }
+                    removed.add(new String[]{match, cn});
                 } else {
                     keep.add(l);
                 }
             }
-            if (remove && !removedClasses.isEmpty()) {
+            if (!removed.isEmpty()) {
                 String status = "removed";
                 String detail = "已从 " + kind + " Listener 列表移除";
                 try {
@@ -303,11 +406,9 @@ public class MemCheckAgent {
                     status = "error";
                     detail = "移除 Listener 失败: " + e.getClass().getSimpleName() + ": " + e.getMessage();
                 }
-                for (String rc : removedClasses) {
-                    String m = rc.substring(0, rc.indexOf('|'));
-                    String cn = rc.substring(rc.indexOf('|') + 1);
-                    items.add(resultItem(m, status, "listener(" + kind + "):" + cn, detail));
-                    handled.put(m, status);
+                for (String[] rc : removed) {
+                    items.add(resultItem(rc[0], status, "listener(" + kind + "):" + rc[1], detail));
+                    handled.put(rc[0], status);
                 }
             }
         } catch (Throwable ignore) {
@@ -319,8 +420,7 @@ public class MemCheckAgent {
     private static Map<String, Boolean> loadedClasses(Instrumentation inst, List<String> targets) {
         Map<String, Boolean> res = new LinkedHashMap<>();
         try {
-            Class<?>[] all = inst.getAllLoadedClasses();
-            for (Class<?> c : all) {
+            for (Class<?> c : inst.getAllLoadedClasses()) {
                 String n = c.getName();
                 for (String t : targets) {
                     if (contains(n, t)) res.put(t, Boolean.TRUE);
@@ -329,15 +429,6 @@ public class MemCheckAgent {
         } catch (Throwable ignore) {
         }
         return res;
-    }
-
-    private static boolean anyLoaded(Map<String, Boolean> loaded, String t) {
-        Boolean b = loaded.get(t);
-        return b != null && b;
-    }
-
-    private static boolean handledContains(Map<String, String> handled, String t) {
-        return handled.containsKey(t);
     }
 
     private static String matchAny(List<String> targets, String... candidates) {
@@ -364,12 +455,10 @@ public class MemCheckAgent {
 
     private static Object invoke1(Object o, String method, Class<?> paramType, Object arg) throws Exception {
         Method m = null;
-        for (Class<?> k = o.getClass(); k != null; k = k.getSuperclass()) {
+        for (Class<?> k = o.getClass(); k != null && m == null; k = k.getSuperclass()) {
             try {
                 m = k.getDeclaredMethod(method, paramType);
-                break;
             } catch (NoSuchMethodException e) {
-                // try assignable param
                 for (Method cand : k.getDeclaredMethods()) {
                     if (cand.getParameterCount() == 1 && cand.getName().equals(method)
                             && cand.getParameterTypes()[0].isAssignableFrom(paramType)) {
@@ -377,7 +466,6 @@ public class MemCheckAgent {
                         break;
                     }
                 }
-                if (m != null) break;
             }
         }
         if (m == null) throw new NoSuchMethodException(method);
@@ -438,9 +526,24 @@ public class MemCheckAgent {
         return out;
     }
 
+    private static String invItem(String kind, String name, String cls, Class<?> k) {
+        return "{\"kind\":\"" + esc(kind) + "\",\"name\":\"" + esc(name) + "\",\"class\":\"" + esc(cls)
+                + "\",\"codeSource\":\"" + esc(codeSourceOf(k)) + "\",\"loader\":\"" + esc(loaderNameOf(k))
+                + "\",\"resolved\":" + (k != null) + "}";
+    }
+
     private static String resultItem(String cls, String status, String registeredAs, String detail) {
         return "{\"class\":\"" + esc(cls) + "\",\"status\":\"" + esc(status)
                 + "\",\"registeredAs\":\"" + esc(registeredAs) + "\",\"detail\":\"" + esc(detail) + "\"}";
+    }
+
+    private static String join(List<String> items) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) b.append(",");
+            b.append(items.get(i));
+        }
+        return b.toString();
     }
 
     private static String esc(String s) {

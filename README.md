@@ -104,11 +104,25 @@ sudo ./memcheck -remove-class PlasmodesmaFilter,EdwardsiidaeFilter -yes
 | `-remove-class s` | 手工指定类名（逗号分隔），隐含 `-remove` |
 | `-yes` | 跳过交互确认（谨慎使用；非交互式环境下不加 `-yes` 一律跳过卸载） |
 
+**检测原理（关键）**：agent 加载后会**枚举运行中 JVM 里每个 Tomcat 上下文已注册的
+全部 Filter/Servlet/Listener**，并对每个组件解析其 `codeSource` 与类加载器，回写给主程序；
+主程序用统一启发式判定可疑项——**核心信号是 `codeSource`**：
+
+- 通过反序列化/`defineClass` 一次性注入的内存马，其类 `codeSource` 通常为空 → 判为可疑；
+- 正常业务/框架过滤器 `codeSource` 指向其 jar → 不误伤；
+- `codeSource` 指向 JSP → JSP 注入器编译加载；
+- 叠加已知内存马特征库、框架白名单、无包名/生僻词+组件后缀/Lambda 伪装等启发式。
+
+因此**即使内存马类名、包名完全正常**（如 `com.company.web.InjectedFilter`），只要它是内存注入
+的、不在磁盘 jar 里，就能被发现并卸载——这正是应对 Shiro/反序列化等“磁盘无文件”一次性注入
+内存马的关键。报告还会列出完整的已注册组件清单（等价 Arthas `sc -d *Filter*`），便于人工核对。
+
 **实现方式**：卸载能力由一个自研 Java agent（`agent/MemCheckAgent.java`）提供，编译为
 `agent.jar` 后通过 `go:embed` **静态内嵌进单一二进制**；运行时释放到临时文件，用**纯 Go 实现的
-HotSpot attach 协议**（无 cgo，`.attach_pid` + `SIGQUIT` + Unix socket）加载进目标 JVM，
-agent 通过反射发现 Tomcat `StandardContext` 并移除恶意 `FilterDef`/`FilterMap`/`filterConfig`
-等注册项，再把结果回写供主程序解析。整个过程不落地依赖 JDK、不需要 Arthas。
+HotSpot attach 协议**（无 cgo，`.attach_pid` + `SIGQUIT` + Unix socket）加载进目标 JVM。
+上下文发现遍历所有已加载类的类加载器定位 webapp 类加载器，**兼容独立 Tomcat 与 Spring Boot
+内嵌 Tomcat**；移除恶意 `FilterDef`/`FilterMap`/`filterConfig` 等注册项后回写结果。
+整个过程不落地依赖 JDK、不需要 Arthas。
 
 **安全模型（务必了解）**：
 

@@ -44,6 +44,7 @@ public class MemCheckAgent {
         List<String> results = new ArrayList<>();
 
         try {
+            openModules(inst); // JDK9+ 打开 java.lang 以便反射 Thread.target
             Set<Object> contexts = findStandardContexts(inst);
             contextsFound = contexts.size();
 
@@ -93,29 +94,202 @@ public class MemCheckAgent {
 
     private static Set<Object> findStandardContexts(Instrumentation inst) {
         Set<Object> ctxs = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
-        Set<ClassLoader> loaders = Collections.newSetFromMap(new IdentityHashMap<ClassLoader, Boolean>());
 
-        // 1) 从所有已加载类的 ClassLoader 中找 webapp 加载器（最稳，不依赖活跃线程）
+        // 路径 A：独立 Tomcat —— 从 webapp 类加载器 getResources().getContext()
         try {
+            Set<ClassLoader> loaders = Collections.newSetFromMap(new IdentityHashMap<ClassLoader, Boolean>());
             for (Class<?> c : inst.getAllLoadedClasses()) {
                 ClassLoader cl = c.getClassLoader();
                 if (cl != null) loaders.add(cl);
             }
-        } catch (Throwable ignore) {
-        }
-        // 2) 线程 contextClassLoader 兜底
-        try {
-            for (Thread th : Thread.getAllStackTraces().keySet()) {
+            for (Thread th : allThreads()) {
                 ClassLoader cl = th.getContextClassLoader();
                 if (cl != null) loaders.add(cl);
             }
+            for (ClassLoader cl : loaders) collectFromLoader(cl, ctxs);
         } catch (Throwable ignore) {
         }
 
-        for (ClassLoader cl : loaders) {
-            collectFromLoader(cl, ctxs);
+        // 路径 B：Spring Boot 内嵌 Tomcat —— 应用类由 LaunchedURLClassLoader 加载、无 WebappClassLoaderBase。
+        // 从 Tomcat 连接器线程(Acceptor/Poller/exec)的 Runnable 出发，对 Tomcat 类型字段做有界反射 BFS，
+        // 经 endpoint->handler->protocol->adapter->connector->service->engine->host 到达 StandardContext。
+        // 不依赖具体方法名，兼容 Tomcat 8.5/9/10 与不同版本内部结构。
+        if (ctxs.isEmpty()) {
+            try {
+                discoverByThreadGraph(ctxs);
+            } catch (Throwable ignore) {
+            }
         }
         return ctxs;
+    }
+
+    private static void discoverByThreadGraph(Set<Object> ctxs) {
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        java.util.ArrayDeque<Object> queue = new java.util.ArrayDeque<Object>();
+        for (Thread t : allThreads()) {
+            String n = t.getName();
+            if (n == null) continue;
+            if (n.contains("Acceptor") || n.contains("Poller") || n.contains("exec-")
+                    || n.startsWith("http-") || n.startsWith("ajp-") || n.contains("Catalina")
+                    || n.contains("ContainerBackground")) {
+                Object target = readThreadTarget(t);
+                if (target != null) queue.add(target);
+            }
+        }
+        int budget = 50000;
+        while (!queue.isEmpty() && budget-- > 0) {
+            Object o = queue.poll();
+            if (o == null || !visited.add(o)) continue;
+            Class<?> c = o.getClass();
+            if (isStandardContext(c)) {
+                ctxs.add(o);
+                continue; // 到达 context 即止，不再深入
+            }
+            String cn = c.getName();
+            if (!(cn.startsWith("org.apache.catalina") || cn.startsWith("org.apache.coyote")
+                    || cn.startsWith("org.apache.tomcat"))) {
+                continue; // 只在 Tomcat 对象图内穿行
+            }
+            for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
+                for (Field f : k.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    if (f.getType().isPrimitive()) continue;
+                    Object v;
+                    try {
+                        f.setAccessible(true);
+                        v = f.get(o);
+                    } catch (Throwable e) {
+                        continue;
+                    }
+                    enqueueValue(v, queue);
+                }
+            }
+        }
+    }
+
+    private static void enqueueValue(Object v, java.util.ArrayDeque<Object> queue) {
+        if (v == null) return;
+        Class<?> vc = v.getClass();
+        if (vc.isArray()) {
+            if (!vc.getComponentType().isPrimitive()) {
+                int len = java.lang.reflect.Array.getLength(v);
+                for (int i = 0; i < len && i < 4096; i++) {
+                    Object e = java.lang.reflect.Array.get(v, i);
+                    if (e != null) queue.add(e);
+                }
+            }
+        } else if (v instanceof java.util.Collection) {
+            for (Object e : (java.util.Collection<?>) v) if (e != null) queue.add(e);
+        } else if (v instanceof Map) {
+            for (Object e : ((Map<?, ?>) v).values()) if (e != null) queue.add(e);
+        } else {
+            queue.add(v);
+        }
+    }
+
+    // openModules 在 JDK9+ 上打开 java.base 的 java.lang 等包给本 agent，便于反射 Thread.target。
+    private static void openModules(Instrumentation inst) {
+        try {
+            Method getModule = Class.class.getMethod("getModule");
+            Object javaBase = getModule.invoke(Thread.class);
+            Object myModule = getModule.invoke(MemCheckAgent.class);
+            Class<?> moduleCls = Class.forName("java.lang.Module");
+            Method redefineModule = Instrumentation.class.getMethod("redefineModule",
+                    moduleCls, Set.class, Map.class, Map.class, Set.class, Map.class);
+            Map<String, Set<?>> opens = new java.util.HashMap<>();
+            Set<Object> mods = Collections.singleton(myModule);
+            for (String p : new String[]{"java.lang", "java.util", "java.util.concurrent", "java.security"}) {
+                opens.put(p, mods);
+            }
+            redefineModule.invoke(inst, javaBase, Collections.emptySet(),
+                    Collections.emptyMap(), opens, Collections.emptySet(), Collections.emptyMap());
+        } catch (Throwable ignore) {
+            // JDK8 无模块系统，忽略
+        }
+    }
+
+    private static Thread[] allThreads() {
+        try {
+            ThreadGroup g = Thread.currentThread().getThreadGroup();
+            while (g.getParent() != null) g = g.getParent();
+            Thread[] arr = new Thread[g.activeCount() + 128];
+            int n = g.enumerate(arr, true);
+            Thread[] res = new Thread[n];
+            System.arraycopy(arr, 0, res, 0, n);
+            return res;
+        } catch (Throwable e) {
+            return Thread.getAllStackTraces().keySet().toArray(new Thread[0]);
+        }
+    }
+
+    private static Object readField(Object obj, String name) {
+        if (obj == null) return null;
+        Field f = findField(obj.getClass(), name);
+        if (f == null) return null;
+        try {
+            f.setAccessible(true);
+            return f.get(obj);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    // readThreadTarget 读取线程持有的 Runnable。
+    //   JDK8: java.lang.Thread.target；JDK9+/21(Loom 重构后): Thread.holder(FieldHolder).task。
+    // JDK9+ 模块封装下 setAccessible 会失败，回退 sun.misc.Unsafe 按字段偏移读取，兼容 JDK8~21。
+    private static Object readThreadTarget(Thread t) {
+        Object v = readJdkField(t, Thread.class, "target"); // JDK8
+        if (v != null) return v;
+        Object holder = readJdkField(t, Thread.class, "holder"); // JDK9+ FieldHolder
+        if (holder != null) {
+            Object task = readJdkField(holder, holder.getClass(), "task");
+            if (task != null) return task;
+        }
+        return null;
+    }
+
+    // readJdkField 读取 JDK 内部对象字段：先常规反射，失败(模块封装)则用 Unsafe 按偏移读。
+    private static Object readJdkField(Object obj, Class<?> declaring, String name) {
+        if (obj == null) return null;
+        Field f;
+        try {
+            f = declaring.getDeclaredField(name);
+        } catch (Throwable e) {
+            return null;
+        }
+        try {
+            f.setAccessible(true);
+            return f.get(obj);
+        } catch (Throwable ignore) {
+        }
+        try {
+            initUnsafe();
+            if (unsafe == null) return null;
+            long off = ((Number) mOffset.invoke(unsafe, f)).longValue();
+            return mGetObj.invoke(unsafe, obj, off);
+        } catch (Throwable e2) {
+            return null;
+        }
+    }
+
+    private static Object unsafe;
+    private static Method mOffset, mGetObj;
+
+    private static void initUnsafe() {
+        if (unsafe != null) return;
+        try {
+            Class<?> uc = Class.forName("sun.misc.Unsafe");
+            Field tf = uc.getDeclaredField("theUnsafe");
+            tf.setAccessible(true);
+            unsafe = tf.get(null);
+            mOffset = uc.getMethod("objectFieldOffset", Field.class);
+            try {
+                mGetObj = uc.getMethod("getObject", Object.class, long.class);
+            } catch (NoSuchMethodException e) {
+                mGetObj = uc.getMethod("getReference", Object.class, long.class);
+            }
+        } catch (Throwable ignore) {
+        }
     }
 
     private static void collectFromLoader(ClassLoader cl, Set<Object> set) {
@@ -161,9 +335,11 @@ public class MemCheckAgent {
             Object defs = invoke(ctx, "findFilterDefs");
             if (defs instanceof Object[]) {
                 for (Object def : (Object[]) defs) {
+                    String fname = str(invoke(def, "getFilterName"));
                     String cls = str(invoke(def, "getFilterClass"));
-                    Class<?> k = resolveClass(webappCl, cls, filterInstance(ctx, str(invoke(def, "getFilterName"))));
-                    out.add(invItem("filter", str(invoke(def, "getFilterName")), cls, k));
+                    Class<?> k = resolveClass(webappCl, cls, filterInstance(ctx, fname));
+                    if ((cls == null || cls.isEmpty()) && k != null) cls = k.getName(); // 声明类名为空时取实例真实类名
+                    out.add(invItem("filter", fname, cls, k));
                 }
             }
         } catch (Throwable ignore) {

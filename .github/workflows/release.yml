@@ -84,8 +84,21 @@ jobs:
 
           ### 特点
           - **零第三方依赖**：仅用 Go 标准库，单一静态二进制，适配 x86_64/ARM64 与断网环境。
-          - **只读安全**：不删除文件、不杀进程、不重启服务，清除交由人工按手册处置。
+          - **只读检测默认安全**：排查阶段不删除文件、不杀进程、不重启服务。
           - 原生读取 \`/proc\`、遍历文件系统、解析 \`/proc/net/tcp\`，不强依赖 ps/find/grep/netstat。
+
+          ### 排查覆盖
+          Java 进程/Agent 参数、磁盘注入器(可疑 JSP/class)、配置篡改(web.xml/server.xml/resin.xml)、
+          网络连接、JVM 运行时(jstack/jmap)、日志、持久化(cron/systemd/启动脚本/SSH/SUID)，
+          内置已知内存马特征库(冰蝎/哥斯拉/代理马)与框架白名单，报告按风险等级排序。
+
+          ### 内存马热卸载（可选，需显式开启，仅 Linux）
+          对应手册第四节「清除操作」的自动化版本：在**不重启服务**的前提下，从运行中的 JVM
+          内存移除恶意 Filter/Servlet/Listener 注册（等价 Arthas OGNL 热清除）。
+          - 卸载能力由自研 Java agent 经 \`go:embed\` **静态内嵌进单一二进制**，运行时以**纯 Go 实现的
+            HotSpot attach 协议**（无 cgo）加载进目标 JVM，不依赖本地 JDK/Arthas。
+          - **默认关闭**，必须显式 \`-remove\` 才有写操作；非交互环境不加 \`-yes\` 一律跳过。
+          - 只在内存移除注册，**不删磁盘文件/不杀进程/不重启**；卸载后仍需删除磁盘注入器与篡改配置，否则会复活。
 
           ### 下载
           | 文件 | 平台 |
@@ -98,9 +111,11 @@ jobs:
           ### 使用
           \`\`\`bash
           chmod +x memcheck_linux_amd64
-          sudo ./memcheck_linux_amd64                 # 自动排查
+          sudo ./memcheck_linux_amd64                 # 自动排查（只读）
           sudo ./memcheck_linux_amd64 -root /opt/tomcat -days 7
           sudo ./memcheck_linux_amd64 -json -o result.json
+          sudo ./memcheck_linux_amd64 -remove         # 扫描并交互式热卸载命中的内存马
+          sudo ./memcheck_linux_amd64 -remove-class PlasmodesmaFilter -yes  # 定向卸载
           \`\`\`
 
           > 仅用于授权范围内的应急响应与安全演练。

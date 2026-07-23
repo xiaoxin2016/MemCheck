@@ -16,11 +16,12 @@ import (
 //go:embed agent/agent.jar
 var agentJar []byte
 
-const removePhase = "阶段九 · 内存马热卸载(attach)"
+const removePhase = "阶段九 · 运行时内存马排查(attach)"
 
-// removeOptions 卸载模式参数
+// removeOptions 运行时排查/卸载参数
 type removeOptions struct {
 	enabled   bool
+	scanOnly  bool     // -attach-scan: 只 attach 枚举报告运行时过滤器链，不做任何卸载
 	classes   []string // -remove-class 显式指定的目标类（覆盖自动推荐）
 	assumeYes bool     // -yes 跳过交互确认
 }
@@ -123,7 +124,11 @@ func runRemoval(rep *Report, procs []JavaProcess, opt removeOptions) {
 	}
 	defer cleanup()
 
-	fmt.Fprintf(os.Stderr, "\n%s[memcheck]%s 进入内存马热卸载模式（只在内存移除注册，不改磁盘/不重启）\n", colYellow, colReset)
+	if opt.scanOnly {
+		fmt.Fprintf(os.Stderr, "\n%s[memcheck]%s 运行时枚举模式（attach 只读枚举过滤器链，不做任何卸载）\n", colCyan, colReset)
+	} else {
+		fmt.Fprintf(os.Stderr, "\n%s[memcheck]%s 内存马热卸载模式（只在内存移除注册，不改磁盘/不重启）\n", colYellow, colReset)
+	}
 
 	for _, p := range procs {
 		processOne(rep, p, jarPath, opt)
@@ -141,11 +146,11 @@ func processOne(rep *Report, p JavaProcess, jarPath string, opt removeOptions) {
 	}
 
 	var candidates []string
-	if len(opt.classes) > 0 {
+	if len(opt.classes) > 0 && !opt.scanOnly {
 		// 手工指定：直接作为候选，跳过枚举
 		candidates = opt.classes
 	} else {
-		// 自动模式：枚举全部已注册组件，用 Go 侧启发式挑出可疑项（不依赖硬编码类名）
+		// 枚举全部已注册组件，用 Go 侧启发式挑出可疑项（不依赖硬编码类名）
 		res, err := runAgent(p.PID, jarPath, "list", nil)
 		if err != nil {
 			rep.addf(SevMedium, removePhase, "remove", "PID "+pidStr+" 运行时枚举失败", err.Error(),
@@ -153,6 +158,17 @@ func processOne(rep *Report, p JavaProcess, jarPath string, opt removeOptions) {
 			return
 		}
 		candidates = reportInventory(rep, p, res)
+	}
+
+	// 只读枚举模式：报告后即返回，不做任何卸载
+	if opt.scanOnly {
+		if len(candidates) > 0 {
+			rep.addf(SevInfo, removePhase, "remove",
+				"PID "+pidStr+" 运行时发现 "+strconv.Itoa(len(candidates))+" 个可疑组件（只读枚举，未卸载）",
+				strings.Join(candidates, ", "),
+				"确认后可用 -remove（自动）或 -remove-class <类名>（定向）热卸载。")
+		}
+		return
 	}
 
 	if len(candidates) == 0 {

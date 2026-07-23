@@ -88,19 +88,27 @@ sudo ./memcheck -full
 内存里移除恶意组件的注册（Filter / Servlet / Listener），等价于手册 [62][63] 的 Arthas OGNL
 热清除。
 
+> **重要**：反序列化/漏洞一次性注入的内存马只存在于 JVM 内存、磁盘无任何文件，
+> 默认的磁盘/配置/日志检测**无法发现**它。必须用 `-attach-scan`（只读枚举）或 `-remove`
+> attach 进 JVM 枚举过滤器链才能看到。默认运行发现 Java 进程时会提示这一点。
+
 ```bash
-# 自动：扫描运行时命中的已知内存马类，逐个请求确认后卸载（默认推荐“有风险的”已注册类）
+# 只读发现：attach 枚举运行时过滤器链，按 codeSource 报告可疑内存马，不做任何卸载
+sudo ./memcheck -attach-scan
+
+# 自动卸载：枚举 + 挑出可疑项，逐个请求确认后热卸载
 sudo ./memcheck -remove
 
 # 定向：手工指定要卸载的类名，跳过确认（自动化场景）
-sudo ./memcheck -remove-class PlasmodesmaFilter,EdwardsiidaeFilter -yes
+sudo ./memcheck -remove-class com.evil.InjectedFilter -yes
 ```
 
 参数：
 
 | 参数 | 说明 |
 |------|------|
-| `-remove` | 开启热卸载。自动扫描每个 JVM，命中已知内存马类时请求确认 |
+| `-attach-scan` | **只读**。attach 枚举运行时过滤器链，报告可疑内存马，不做任何卸载 |
+| `-remove` | 枚举 + 挑出可疑项，逐个请求确认后热卸载 |
 | `-remove-class s` | 手工指定类名（逗号分隔），隐含 `-remove` |
 | `-yes` | 跳过交互确认（谨慎使用；非交互式环境下不加 `-yes` 一律跳过卸载） |
 

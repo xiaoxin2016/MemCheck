@@ -14,11 +14,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
-var version = "1.2.0"
+var version = "1.3.0"
 
 func main() {
 	var (
@@ -33,7 +34,8 @@ func main() {
 		noNet    = flag.Bool("no-net", false, "跳过网络连接排查")
 		showVer  = flag.Bool("version", false, "打印版本并退出")
 		maxFile  = flag.Int64("max-file", 512*1024, "读取文件内容的单文件字节上限")
-		remove   = flag.Bool("remove", false, "热卸载模式：对运行时命中的已知内存马类，交互确认后尝试从内存移除")
+		attachSc = flag.Bool("attach-scan", false, "只读运行时排查：attach 目标 JVM 枚举过滤器链，报告可疑内存马（不卸载）")
+		remove   = flag.Bool("remove", false, "热卸载模式：枚举运行时过滤器链，交互确认后从内存移除可疑内存马")
 		rmClass  = flag.String("remove-class", "", "手工指定要卸载的类名（逗号分隔，隐含开启 -remove）")
 		assumeY  = flag.Bool("yes", false, "卸载时跳过交互确认（自动化场景，谨慎使用）")
 	)
@@ -120,15 +122,28 @@ func main() {
 	progress(*jsonOut, "排查定时任务/启动项/SSH/SUID...")
 	checkPersistence(rep, roots, cfg)
 
-	// —— 阶段九：内存马热卸载（可选，需显式开启）——
+	// —— 阶段九：运行时内存马排查（可选，需显式开启）——
+	removeMode := *remove || *rmClass != ""
+	scanMode := *attachSc && !removeMode
 	rmOpt := removeOptions{
-		enabled:   *remove || *rmClass != "",
+		enabled:   removeMode || scanMode,
+		scanOnly:  scanMode,
 		classes:   splitCSV(*rmClass),
 		assumeYes: *assumeY,
 	}
 	if rmOpt.enabled {
-		progress(*jsonOut, "内存马热卸载 (attach)...")
+		if scanMode {
+			progress(*jsonOut, "运行时过滤器链枚举 (attach, 只读)...")
+		} else {
+			progress(*jsonOut, "内存马热卸载 (attach)...")
+		}
 		runRemoval(rep, procs, rmOpt)
+	} else if len(procs) > 0 && attachSupported {
+		// 发现 JVM 但未做运行时排查：内存注入型内存马无法靠磁盘/配置发现，明确引导
+		rep.addf(SevInfo, "阶段九 · 运行时内存马排查(attach)",
+			"remove", "发现 "+strconv.Itoa(len(procs))+" 个 Java 进程，但未做运行时排查",
+			"", "反序列化/漏洞一次性注入的内存马只存在于 JVM 内存、磁盘无文件，仅靠上面的磁盘/配置检测无法发现。"+
+				"请加 -attach-scan 只读枚举运行时过滤器链，或加 -remove 直接枚举并卸载。")
 	}
 
 	// 输出
@@ -210,12 +225,13 @@ func usage() {
   -max-file int    单文件读取上限字节（默认 524288）
   -version         打印版本
 
-热卸载（危险操作，需显式开启；仅 Linux）:
-  -remove          对运行时命中的已知内存马类，交互确认后尝试从内存移除注册
+运行时排查/热卸载（需显式开启；仅 Linux）:
+  -attach-scan     只读：attach 目标 JVM，枚举过滤器链并按 codeSource 报告可疑内存马（不卸载）
+  -remove          枚举运行时过滤器链，交互确认后从内存移除可疑内存马
   -remove-class s  手工指定要卸载的类名（逗号分隔，隐含 -remove）
   -yes             跳过交互确认（自动化场景，谨慎使用）
-  说明: 只在内存中移除 Filter/Servlet/Listener 注册，不删除磁盘文件、不重启服务。
-        卸载后务必再删除磁盘注入器与篡改配置，否则重启或再次访问会复活。建议 root 运行。
+  说明: 反序列化/漏洞一次性注入的内存马只在 JVM 内存、磁盘无文件，必须用 -attach-scan/-remove
+        才能发现。卸载只在内存移除注册，不删磁盘文件、不重启；卸载后仍需清磁盘注入器/配置。建议 root 运行。
 
 退出码:
   0 未见异常  1 存在中/低危  2 存在高危/严重
@@ -224,7 +240,8 @@ func usage() {
   sudo ./memcheck
   sudo ./memcheck -root /opt/tomcat -days 7
   sudo ./memcheck -json -o /tmp/memcheck.json
-  sudo ./memcheck -remove                       # 扫描并交互式卸载命中的内存马
+  sudo ./memcheck -attach-scan                  # 只读枚举运行时过滤器链，发现内存注入型内存马
+  sudo ./memcheck -remove                       # 枚举并交互式卸载可疑内存马
   sudo ./memcheck -remove-class PlasmodesmaFilter -yes   # 定向卸载指定类
 `, version)
 }

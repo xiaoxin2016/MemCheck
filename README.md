@@ -158,10 +158,30 @@ HotSpot attach 协议**（无 cgo，`.attach_pid` + `SIGQUIT` + Unix socket）�
 连接、命令等）与处置建议，并附手册「六、排查结果判断指南」的 `codeSource` 研判要点与
 下一步人工清除指引。
 
+## 附带 Arthas（人工复核 / 兜底）
+
+仓库随附 `arthas-boot.jar`（Alibaba 开源的 Java 诊断工具，Apache-2.0），用于对 MemCheck
+的运行时判定做人工复核，或在本工具未覆盖的场景（非 Tomcat 容器、复杂加载链）手工排查。
+官网与文档：<https://arthas.aliyun.com/>
+
+```bash
+# 连接目标 JVM（列出所有 Java 进程，输入编号选择）
+java -jar arthas-boot.jar
+
+# 进入交互界面后常用命令：
+sc -d *Filter*                  # 列出所有 Filter 类
+sc -d com.xxx.EvilFilter        # 查该类的 classLoader / codeSource（为空或指向 JSP 即可疑）
+jad com.xxx.EvilFilter          # 反编译确认是否恶意
+thread                          # 查代理线程（Socket.connect 等特征）
+```
+
+> `arthas-boot.jar` 只是引导器，首次运行会联网下载完整 arthas 到 `~/.arthas/`。
+> **断网现场**请改用官网的 arthas-bin 完整离线包，或预先填充 `~/.arthas/lib`。
+
 ## 注意事项
 
-- 运行时检测（Arthas）最精准但需交互式操作，无法自动化；断网现场请按手册用 U 盘拷入
-  `arthas-boot.jar`，用 `sc -d` 查恶意类的 `codeSource`/`classLoader` 定位注入来源。
+- 运行时检测（Arthas）最精准但需交互式操作，无法完全自动化；断网现场按上节用 `arthas-boot.jar`，
+  用 `sc -d` 查恶意类的 `codeSource`/`classLoader` 定位注入来源。
 - `jstack`/`jmap` 通常需与目标 Java 进程 **同一用户** 才能连接，必要时 `sudo -u <appuser>` 运行。
 - 本工具用于 **授权范围内** 的应急响应与安全演练。
 ```

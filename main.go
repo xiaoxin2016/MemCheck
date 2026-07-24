@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-var version = "1.3.1"
+var version = "1.4.0"
 
 func main() {
 	var (
@@ -34,7 +34,8 @@ func main() {
 		noNet    = flag.Bool("no-net", false, "跳过网络连接排查")
 		showVer  = flag.Bool("version", false, "打印版本并退出")
 		maxFile  = flag.Int64("max-file", 512*1024, "读取文件内容的单文件字节上限")
-		attachSc = flag.Bool("attach-scan", false, "只读运行时排查：attach 目标 JVM 枚举过滤器链，报告可疑内存马（不卸载）")
+		attachSc = flag.Bool("attach-scan", false, "强制只读运行时枚举（默认已开启；-no-attach 时仍可用它强制开启）")
+		noAttach = flag.Bool("no-attach", false, "禁用默认的运行时 attach 枚举，回到纯被动(不接触 JVM)检测")
 		remove   = flag.Bool("remove", false, "热卸载模式：枚举运行时过滤器链，交互确认后从内存移除可疑内存马")
 		rmClass  = flag.String("remove-class", "", "手工指定要卸载的类名（逗号分隔，隐含开启 -remove）")
 		assumeY  = flag.Bool("yes", false, "卸载时跳过交互确认（自动化场景，谨慎使用）")
@@ -70,7 +71,7 @@ func main() {
 	}
 
 	if !*jsonOut {
-		fmt.Fprintf(os.Stderr, "%s[memcheck]%s 开始排查（只读，不做任何删除/重启）...\n", colCyan, colReset)
+		fmt.Fprintf(os.Stderr, "%s[memcheck]%s 开始排查（只读，不删文件/不杀进程/不重启；默认会 attach JVM 做只读枚举，-no-attach 可关闭）...\n", colCyan, colReset)
 	}
 
 	cfg := scanConfig{
@@ -122,28 +123,30 @@ func main() {
 	progress(*jsonOut, "排查定时任务/启动项/SSH/SUID...")
 	checkPersistence(rep, roots, cfg)
 
-	// —— 阶段九：运行时内存马排查（可选，需显式开启）——
+	// —— 阶段九：运行时内存马排查 ——
+	// 默认即对发现的 JVM 做只读 attach 运行时枚举（内存注入型内存马只能这样发现）；
+	// -no-attach 关闭该默认行为；-attach-scan 可在 -no-attach 时强制开启；-remove 则进入卸载。
 	removeMode := *remove || *rmClass != ""
-	scanMode := *attachSc && !removeMode
+	runtimeScan := attachSupported && len(procs) > 0 && !removeMode && (*attachSc || !*noAttach)
 	rmOpt := removeOptions{
-		enabled:   removeMode || scanMode,
-		scanOnly:  scanMode,
+		enabled:   removeMode || runtimeScan,
+		scanOnly:  runtimeScan,
 		classes:   splitCSV(*rmClass),
 		assumeYes: *assumeY,
 	}
 	if rmOpt.enabled {
-		if scanMode {
+		if rmOpt.scanOnly {
 			progress(*jsonOut, "运行时过滤器链枚举 (attach, 只读)...")
 		} else {
 			progress(*jsonOut, "内存马热卸载 (attach)...")
 		}
 		runRemoval(rep, procs, rmOpt)
-	} else if len(procs) > 0 && attachSupported {
-		// 发现 JVM 但未做运行时排查：内存注入型内存马无法靠磁盘/配置发现，明确引导
+	} else if len(procs) > 0 && attachSupported && *noAttach {
+		// 用户用 -no-attach 主动关闭了运行时排查：提醒内存注入型内存马将无法发现
 		rep.addf(SevInfo, "阶段九 · 运行时内存马排查(attach)",
-			"remove", "发现 "+strconv.Itoa(len(procs))+" 个 Java 进程，但未做运行时排查",
-			"", "反序列化/漏洞一次性注入的内存马只存在于 JVM 内存、磁盘无文件，仅靠上面的磁盘/配置检测无法发现。"+
-				"请加 -attach-scan 只读枚举运行时过滤器链，或加 -remove 直接枚举并卸载。")
+			"remove", "已按 -no-attach 跳过运行时排查（发现 "+strconv.Itoa(len(procs))+" 个 Java 进程）",
+			"", "反序列化/漏洞一次性注入的内存马只存在于 JVM 内存、磁盘无文件，纯被动检测无法发现。"+
+				"去掉 -no-attach（默认即会 attach 只读枚举），或加 -remove 直接枚举并卸载。")
 	}
 
 	// 输出
@@ -225,13 +228,15 @@ func usage() {
   -max-file int    单文件读取上限字节（默认 524288）
   -version         打印版本
 
-运行时排查/热卸载（需显式开启；仅 Linux）:
-  -attach-scan     只读：attach 目标 JVM，枚举过滤器链并按 codeSource 报告可疑内存马（不卸载）
+运行时排查/热卸载（仅 Linux）:
+  （默认）      发现 Java 进程时自动 attach 目标 JVM，只读枚举过滤器链并按 codeSource 报告可疑内存马
+  -no-attach       禁用上述默认行为，回到纯被动(不接触 JVM)检测
+  -attach-scan     即使用了 -no-attach 也强制做只读运行时枚举
   -remove          枚举运行时过滤器链，交互确认后从内存移除可疑内存马
   -remove-class s  手工指定要卸载的类名（逗号分隔，隐含 -remove）
   -yes             跳过交互确认（自动化场景，谨慎使用）
-  说明: 反序列化/漏洞一次性注入的内存马只在 JVM 内存、磁盘无文件，必须用 -attach-scan/-remove
-        才能发现。卸载只在内存移除注册，不删磁盘文件、不重启；卸载后仍需清磁盘注入器/配置。建议 root 运行。
+  说明: 反序列化/漏洞一次性注入的内存马只在 JVM 内存、磁盘无文件，只有 attach 运行时枚举才能发现，
+        故默认开启（只读，不改动应用）。卸载只在内存移除注册，不删磁盘文件、不重启。建议 root 运行。
 
 退出码:
   0 未见异常  1 存在中/低危  2 存在高危/严重
@@ -240,8 +245,9 @@ func usage() {
   sudo ./memcheck
   sudo ./memcheck -root /opt/tomcat -days 7
   sudo ./memcheck -json -o /tmp/memcheck.json
-  sudo ./memcheck -attach-scan                  # 只读枚举运行时过滤器链，发现内存注入型内存马
+  sudo ./memcheck                               # 默认即 attach 只读枚举运行时过滤器链，发现内存注入型内存马
+  sudo ./memcheck -no-attach                    # 纯被动检测，不接触任何 JVM
   sudo ./memcheck -remove                       # 枚举并交互式卸载可疑内存马
-  sudo ./memcheck -remove-class PlasmodesmaFilter -yes   # 定向卸载指定类
+  sudo ./memcheck -remove-class GodzillaFilter -yes      # 定向卸载指定类
 `, version)
 }

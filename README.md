@@ -89,25 +89,31 @@ sudo ./memcheck -full
 热清除。
 
 > **重要**：反序列化/漏洞一次性注入的内存马只存在于 JVM 内存、磁盘无任何文件，
-> 默认的磁盘/配置/日志检测**无法发现**它。必须用 `-attach-scan`（只读枚举）或 `-remove`
-> attach 进 JVM 枚举过滤器链才能看到。默认运行发现 Java 进程时会提示这一点。
+> 纯被动的磁盘/配置/日志检测**无法发现**它，只有 attach 进 JVM 枚举过滤器链才能看到。
+> 因此 **v1.4.0 起，默认运行即会对发现的 Java 进程做只读 attach 运行时枚举**（不改动应用），
+> 用 `-no-attach` 可关闭。经真机验证可发现 Spring Boot 内嵌 Tomcat 中的哥斯拉等内存马。
 
 ```bash
-# 只读发现：attach 枚举运行时过滤器链，按 codeSource 报告可疑内存马，不做任何卸载
-sudo ./memcheck -attach-scan
+# 默认：直接运行即 attach 只读枚举运行时过滤器链，按 codeSource 报告可疑内存马
+sudo ./memcheck
+
+# 纯被动检测，不接触任何 JVM
+sudo ./memcheck -no-attach
 
 # 自动卸载：枚举 + 挑出可疑项，逐个请求确认后热卸载
 sudo ./memcheck -remove
 
 # 定向：手工指定要卸载的类名，跳过确认（自动化场景）
-sudo ./memcheck -remove-class com.evil.InjectedFilter -yes
+sudo ./memcheck -remove-class com.summersec.x.GodzillaFilter -yes
 ```
 
 参数：
 
 | 参数 | 说明 |
 |------|------|
-| `-attach-scan` | **只读**。attach 枚举运行时过滤器链，报告可疑内存马，不做任何卸载 |
+| （默认） | 发现 Java 进程时自动 attach 只读枚举运行时过滤器链，报告可疑内存马（不卸载、不改动应用） |
+| `-no-attach` | 关闭上述默认行为，回到纯被动（不接触 JVM）检测 |
+| `-attach-scan` | 即使用了 `-no-attach` 也强制做只读运行时枚举 |
 | `-remove` | 枚举 + 挑出可疑项，逐个请求确认后热卸载 |
 | `-remove-class s` | 手工指定类名（逗号分隔），隐含 `-remove` |
 | `-yes` | 跳过交互确认（谨慎使用；非交互式环境下不加 `-yes` 一律跳过卸载） |

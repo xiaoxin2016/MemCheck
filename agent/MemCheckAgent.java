@@ -54,6 +54,7 @@ public class MemCheckAgent {
                     handleFilters(ctx, targets, handled, results);
                     handleServlets(ctx, targets, handled, results);
                     handleListeners(ctx, targets, handled, results);
+                    handleValves(ctx, targets, handled, results);
                 }
                 Map<String, Boolean> loaded = loadedClasses(inst, targets);
                 for (String t : targets) {
@@ -330,29 +331,28 @@ public class MemCheckAgent {
 
     private static void enumerate(Object ctx, List<String> out) {
         ClassLoader webappCl = webappLoaderOf(ctx);
-        // Filter
+        // Filter —— 优先用运行中的实例确定真实类（声明的 filterClass 可被伪造）
         try {
             Object defs = invoke(ctx, "findFilterDefs");
             if (defs instanceof Object[]) {
                 for (Object def : (Object[]) defs) {
                     String fname = str(invoke(def, "getFilterName"));
-                    String cls = str(invoke(def, "getFilterClass"));
-                    Class<?> k = resolveClass(webappCl, cls, filterInstance(ctx, fname));
-                    if ((cls == null || cls.isEmpty()) && k != null) cls = k.getName(); // 声明类名为空时取实例真实类名
-                    out.add(invItem("filter", fname, cls, k));
+                    String declared = str(invoke(def, "getFilterClass"));
+                    Object inst = filterInstance(ctx, fname);
+                    if (inst == null) inst = tryGet(def, "getFilter"); // FilterDef 直接持有实例的情形
+                    out.add(component("filter", fname, declared, inst, webappCl));
                 }
             }
         } catch (Throwable ignore) {
         }
-        // Servlet（Wrapper 子容器）
+        // Servlet（Wrapper 子容器）—— 同样优先取 Wrapper 持有的 servlet 实例
         try {
             Object children = invoke(ctx, "findChildren");
             if (children instanceof Object[]) {
                 for (Object w : (Object[]) children) {
                     if (!hasMethod(w.getClass(), "getServletClass")) continue;
-                    String scls = str(invoke(w, "getServletClass"));
-                    if (scls == null) continue;
-                    out.add(invItem("servlet", str(invoke(w, "getName")), scls, resolveClass(webappCl, scls, null)));
+                    String declared = str(invoke(w, "getServletClass"));
+                    out.add(component("servlet", str(invoke(w, "getName")), declared, servletInstance(w), webappCl));
                 }
             }
         } catch (Throwable ignore) {
@@ -360,6 +360,44 @@ public class MemCheckAgent {
         // Listener
         enumerateListeners(ctx, "getApplicationEventListeners", out);
         enumerateListeners(ctx, "getApplicationLifecycleListeners", out);
+        // Valve（Pipeline）—— Valve 型内存马同样常见，此前完全未覆盖
+        enumerateValves(ctx, out);
+    }
+
+    // component 统一构造一条组件记录：以实例的真实类为准，declared 保留声明值供比对(伪装检测)。
+    private static String component(String kind, String name, String declared, Object instance, ClassLoader cl) {
+        Class<?> k = instance != null ? instance.getClass() : resolveClass(cl, declared, null);
+        String actual = k != null ? k.getName() : "";
+        return invItem(kind, name, actual, declared, k);
+    }
+
+    // servletInstance 取 Wrapper 已持有的 servlet 实例；只读字段/getter，不触发实例化。
+    private static Object servletInstance(Object wrapper) {
+        Object v = readField(wrapper, "instance"); // StandardWrapper.instance
+        if (v != null) return v;
+        return tryGet(wrapper, "getServlet");      // 普通 getter，不会 allocate
+    }
+
+    private static Object tryGet(Object o, String getter) {
+        try {
+            return invoke(o, getter);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    private static void enumerateValves(Object ctx, List<String> out) {
+        try {
+            Object pipeline = invoke(ctx, "getPipeline");
+            if (pipeline == null) return;
+            Object valves = invoke(pipeline, "getValves");
+            if (valves instanceof Object[]) {
+                for (Object v : (Object[]) valves) {
+                    if (v != null) out.add(invItem("valve", "", v.getClass().getName(), "", v.getClass()));
+                }
+            }
+        } catch (Throwable ignore) {
+        }
     }
 
     private static void enumerateListeners(Object ctx, String getter, List<String> out) {
@@ -367,7 +405,7 @@ public class MemCheckAgent {
             Object arr = invoke(ctx, getter);
             if (arr instanceof Object[]) {
                 for (Object l : (Object[]) arr) {
-                    if (l != null) out.add(invItem("listener", "", l.getClass().getName(), l.getClass()));
+                    if (l != null) out.add(invItem("listener", "", l.getClass().getName(), "", l.getClass()));
                 }
             }
         } catch (Throwable ignore) {
@@ -514,8 +552,12 @@ public class MemCheckAgent {
                 if (!hasMethod(w.getClass(), "getServletClass")) continue;
                 String sclass = str(invoke(w, "getServletClass"));
                 String sname = str(invoke(w, "getName"));
-                String match = matchAny(targets, sclass);
+                Object sinst = servletInstance(w);
+                String actual = sinst != null ? sinst.getClass().getName() : null;
+                // 声明类名可被伪造(如写成 URL)，故同时按真实实例类名与注册名匹配
+                String match = matchAny(targets, sclass, actual, sname);
                 if (match == null) continue;
+                if (actual != null) sclass = actual;
                 String registeredAs = "servlet:" + sname + " -> " + sclass;
                 String status = "removed";
                 String detail;
@@ -540,6 +582,37 @@ public class MemCheckAgent {
                     detail = "移除 Servlet 失败: " + e.getClass().getSimpleName() + ": " + e.getMessage();
                 }
                 items.add(resultItem(match, status, registeredAs, detail));
+                handled.put(match, status);
+            }
+        } catch (Throwable ignore) {
+        }
+    }
+
+    // handleValves 从 Pipeline 中移除恶意 Valve（Valve 型内存马）。
+    private static void handleValves(Object ctx, List<String> targets,
+                                     Map<String, String> handled, List<String> items) {
+        try {
+            Object pipeline = invoke(ctx, "getPipeline");
+            if (pipeline == null) return;
+            Object valves = invoke(pipeline, "getValves");
+            if (!(valves instanceof Object[])) return;
+            for (Object v : (Object[]) valves) {
+                if (v == null) continue;
+                String cn = v.getClass().getName();
+                String match = matchAny(targets, cn);
+                if (match == null) continue;
+                String status = "removed";
+                String detail;
+                try {
+                    ClassLoader ccl = ctx.getClass().getClassLoader();
+                    Class<?> valveCls = ccl.loadClass("org.apache.catalina.Valve");
+                    invoke1(pipeline, "removeValve", valveCls, v);
+                    detail = "已从 Pipeline 移除 Valve";
+                } catch (Throwable e) {
+                    status = "error";
+                    detail = "移除 Valve 失败: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+                }
+                items.add(resultItem(match, status, "valve:" + cn, detail));
                 handled.put(match, status);
             }
         } catch (Throwable ignore) {
@@ -702,8 +775,9 @@ public class MemCheckAgent {
         return out;
     }
 
-    private static String invItem(String kind, String name, String cls, Class<?> k) {
+    private static String invItem(String kind, String name, String cls, String declared, Class<?> k) {
         return "{\"kind\":\"" + esc(kind) + "\",\"name\":\"" + esc(name) + "\",\"class\":\"" + esc(cls)
+                + "\",\"declared\":\"" + esc(declared)
                 + "\",\"codeSource\":\"" + esc(codeSourceOf(k)) + "\",\"loader\":\"" + esc(loaderNameOf(k))
                 + "\",\"resolved\":" + (k != null) + "}";
     }

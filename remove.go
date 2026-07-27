@@ -35,14 +35,45 @@ type agentResult struct {
 	Results       []agentItem `json:"results"`   // action=remove 返回的处置结果
 }
 
-// invItem 一条已注册组件（Filter/Servlet/Listener）
+// invItem 一条已注册组件（Filter/Servlet/Listener/Valve）
 type invItem struct {
 	Kind       string `json:"kind"`
 	Name       string `json:"name"`
-	Class      string `json:"class"`
+	Class      string `json:"class"`      // 真实类名（优先取运行实例的类）
+	Declared   string `json:"declared"`   // 容器中声明的类名（可被伪造，用于比对）
 	CodeSource string `json:"codeSource"` // 类的 codeSource 位置；内存注入通常为空
 	Loader     string `json:"loader"`     // 加载该类的 classloader 类型
-	Resolved   bool   `json:"resolved"`   // 是否成功解析到 Class（拿到 codeSource）
+	Resolved   bool   `json:"resolved"`   // 是否成功拿到 Class（据此才有 codeSource）
+}
+
+// ref 返回用于展示/卸载定位的最佳标识：真实类名 > 声明类名 > 注册名。
+func (it invItem) ref() string {
+	if it.Class != "" {
+		return it.Class
+	}
+	if it.Declared != "" {
+		return it.Declared
+	}
+	return it.Name
+}
+
+// looksLikeClassName 判断字符串是否像一个 Java 类名。
+// 内存马常把 servletClass/filterClass 伪造成 URL 等非类名字符串来规避基于类名的排查。
+func looksLikeClassName(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.ContainsAny(s, "/\\ \t:?&=") {
+		return false
+	}
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	// 首字符须为合法 Java 标识符起始字符
+	c := s[0]
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 type agentItem struct {
@@ -57,21 +88,43 @@ type agentItem struct {
 // 而正常应用/框架的组件 codeSource 指向其 jar——这样即使内存马类名/包名完全正常也能被发现，
 // 且不会误伤有正常 codeSource 的业务过滤器。对应手册对 codeSource 的研判逻辑。
 func classifyComponent(it invItem) (sev Severity, reason string, candidate bool) {
-	// 已知内存马特征（类名或注册名命中）→ 最高优先
-	if d, ok := matchKnownMalware(it.Class); ok {
-		return SevCritical, "命中已知内存马特征: " + d, true
-	}
-	if it.Name != "" {
-		if d, ok := matchKnownMalware(it.Name); ok {
-			return SevCritical, "注册名命中已知内存马特征: " + d, true
+	// 已知内存马特征（真实类名/声明类名/注册名任一命中）→ 最高优先
+	for _, s := range []string{it.Class, it.Declared, it.Name} {
+		if s == "" {
+			continue
+		}
+		if d, ok := matchKnownMalware(s); ok {
+			return SevCritical, "命中已知内存马特征: " + d, true
 		}
 	}
+
+	// 声明的类名根本不像类名（如被写成 URL）→ 典型的规避手法，无论能否解析都要报
+	if it.Declared != "" && !looksLikeClassName(it.Declared) {
+		return SevCritical,
+			"声明的类名不是合法类名(" + truncate(it.Declared, 60) + ")，疑似伪造注册以规避排查", true
+	}
+
+	// 拿不到真实类：既无运行实例、声明类名也解析不出 → 不能静默放过
+	if !it.Resolved {
+		if isTrustedClassName(it.Declared) {
+			return SevLow, "框架组件但未解析到类(可能尚未实例化)", false
+		}
+		return SevHigh, "无法解析该组件的类(无运行实例且类名不可加载)，需人工确认", true
+	}
+
+	// 声明类名与实际实例类名不符 → 伪装
+	if it.Declared != "" && it.Class != "" && it.Declared != it.Class &&
+		!strings.HasPrefix(it.Class, it.Declared) { // 内部类/代理等前缀相同的情形不算
+		return SevCritical,
+			"声明类名(" + truncate(it.Declared, 40) + ")与实际实例类(" + truncate(it.Class, 40) + ")不符，疑似伪装", true
+	}
+
 	// 框架/JDK 内部 → 正常，跳过
 	if isTrustedClassName(it.Class) || isWhitelistedFilter(it.Class) {
 		return SevInfo, "", false
 	}
-	// codeSource 为空 + 已成功解析到类 → 极可能是内存注入（defineClass 无 ProtectionDomain）
-	if it.Resolved && it.CodeSource == "" {
+	// codeSource 为空 → 极可能是内存注入（defineClass 无 ProtectionDomain）
+	if it.CodeSource == "" {
 		return SevCritical, "codeSource 为空，疑似内存注入(反序列化/defineClass)", true
 	}
 	// codeSource 指向 JSP → JSP 注入器编译加载
@@ -85,10 +138,6 @@ func classifyComponent(it invItem) (sev Severity, reason string, candidate bool)
 	// Lambda 伪装
 	if strings.Contains(it.Class, "$$Lambda$") && !isTrustedClassName(it.Class) {
 		return SevHigh, "Lambda 表达式伪装的 " + it.Kind, true
-	}
-	// 类无法解析（可能已被隐藏）→ 提示但不自动卸载
-	if !it.Resolved {
-		return SevLow, "无法解析该类(可能已卸载/隐藏)", false
 	}
 	return SevInfo, "", false
 }
@@ -221,20 +270,27 @@ func reportInventory(rep *Report, p JavaProcess, res *agentResult) []string {
 			listeners++
 		}
 		sev, reason, cand := classifyComponent(it)
+		where := it.Kind
+		if it.Name != "" {
+			where += ":" + it.Name
+		}
 		if cand {
 			suspicious++
-			where := it.Kind
-			if it.Name != "" {
-				where += ":" + it.Name
-			}
 			rep.addf(sev, removePhase, "remove",
-				"PID "+pidStr+" 运行时发现可疑"+it.Kind+": "+it.Class,
-				where+" -> "+it.Class+"  ("+reason+")",
+				"PID "+pidStr+" 运行时发现可疑"+it.Kind+": "+it.ref(),
+				where+" -> "+describeComponent(it)+"  ("+reason+")",
 				"疑似内存马，下方将请求确认后热卸载。")
-			if it.Class != "" && !seen[it.Class] {
-				seen[it.Class] = true
-				candidates = append(candidates, it.Class)
+			// 类名可能被伪造，回退用注册名定位，保证卸载能命中
+			if k := it.ref(); k != "" && !seen[k] {
+				seen[k] = true
+				candidates = append(candidates, k)
 			}
+		} else if sev > SevInfo {
+			// 未达到自动卸载门槛但值得留痕，不再静默丢弃
+			rep.addf(sev, removePhase, "remove",
+				"PID "+pidStr+" 运行时组件需人工确认: "+it.ref(),
+				where+" -> "+describeComponent(it)+"  ("+reason+")",
+				"未自动列为卸载候选，请人工核对。")
 		}
 	}
 
@@ -248,6 +304,23 @@ func reportInventory(rep *Report, p JavaProcess, res *agentResult) []string {
 	return candidates
 }
 
+// describeComponent 描述来源：区分「解析到类但 codeSource 为空(内存注入)」与「压根没解析到类」。
+func describeComponent(it invItem) string {
+	s := it.ref()
+	if it.Declared != "" && it.Declared != it.Class {
+		s += "  [声明:" + truncate(it.Declared, 60) + "]"
+	}
+	switch {
+	case !it.Resolved:
+		s += "  (未解析到类，无法取 codeSource)"
+	case it.CodeSource == "":
+		s += "  (codeSource=空)"
+	default:
+		s += "  (" + it.CodeSource + ")"
+	}
+	return s
+}
+
 func inventoryList(inv []invItem) string {
 	var b strings.Builder
 	for _, it := range inv {
@@ -255,11 +328,7 @@ func inventoryList(inv []invItem) string {
 		if name == "" {
 			name = "-"
 		}
-		cs := it.CodeSource
-		if cs == "" {
-			cs = "codeSource=空"
-		}
-		fmt.Fprintf(&b, "\n  [%s] %s : %s  (%s)", it.Kind, name, it.Class, cs)
+		fmt.Fprintf(&b, "\n  [%s] %s : %s", it.Kind, name, describeComponent(it))
 	}
 	s := b.String()
 	if len(s) > 4000 {

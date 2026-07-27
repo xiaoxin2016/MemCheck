@@ -5,6 +5,84 @@ import (
 	"testing"
 )
 
+func TestLooksLikeClassName(t *testing.T) {
+	valid := []string{"com.evil.EvilServlet", "CmdFilter", "com.x.Foo$Bar", "_x"}
+	for _, s := range valid {
+		if !looksLikeClassName(s) {
+			t.Errorf("looksLikeClassName(%q) = false, want true", s)
+		}
+	}
+	// 内存马常把 servletClass 伪造成 URL 等非类名字符串
+	invalid := []string{"/favicondemo.ico", "", "/", "a b", "http://x/y", "中文类"}
+	for _, s := range invalid {
+		if looksLikeClassName(s) {
+			t.Errorf("looksLikeClassName(%q) = true, want false", s)
+		}
+	}
+}
+
+// 复现真机场景：servletClass 被伪造成 URL，真实类从运行实例取得。
+func TestClassifyForgedServletClass(t *testing.T) {
+	it := invItem{
+		Kind: "servlet", Name: "/favicondemo.ico",
+		Class: "com.evil.EvilServlet", Declared: "/favicondemo.ico",
+		CodeSource: "", Resolved: true,
+	}
+	sev, reason, cand := classifyComponent(it)
+	if !cand || sev != SevCritical {
+		t.Errorf("伪造 servletClass 应判严重候选，得到 sev=%v cand=%v reason=%q", sev, cand, reason)
+	}
+}
+
+// 未解析到类且非框架组件：不得被静默放过（此前的漏检点）。
+func TestClassifyUnresolvedNotSilentlyDropped(t *testing.T) {
+	it := invItem{Kind: "servlet", Name: "x", Declared: "com.unknown.Thing", Resolved: false}
+	sev, _, cand := classifyComponent(it)
+	if !cand || sev < SevHigh {
+		t.Errorf("未解析的非框架组件应成为候选(>=High)，得到 sev=%v cand=%v", sev, cand)
+	}
+	// 框架组件未实例化则不应误报
+	fw := invItem{Kind: "filter", Declared: "org.springframework.web.filter.CharacterEncodingFilter", Resolved: false}
+	if _, _, c := classifyComponent(fw); c {
+		t.Error("框架组件未实例化不应列为候选")
+	}
+}
+
+// 声明类名与实际实例类名不符 → 伪装。
+func TestClassifyDeclaredActualMismatch(t *testing.T) {
+	it := invItem{
+		Kind: "filter", Name: "f",
+		Declared: "org.springframework.web.filter.CharacterEncodingFilter",
+		Class:    "com.evil.Backdoor", CodeSource: "file:/app.jar", Resolved: true,
+	}
+	if _, _, cand := classifyComponent(it); !cand {
+		t.Error("声明类名与实际实例类不符应判为可疑")
+	}
+}
+
+// Valve 型内存马（此前完全未枚举）。
+func TestClassifyInjectedValve(t *testing.T) {
+	evil := invItem{Kind: "valve", Class: "com.evil.EvilValve", CodeSource: "", Resolved: true}
+	if _, _, cand := classifyComponent(evil); !cand {
+		t.Error("codeSource 为空的 Valve 应判为可疑")
+	}
+	ok := invItem{Kind: "valve", Class: "org.apache.catalina.core.StandardContextValve",
+		CodeSource: "file:/tomcat.jar", Resolved: true}
+	if _, _, cand := classifyComponent(ok); cand {
+		t.Error("Tomcat 自带 Valve 不应误报")
+	}
+}
+
+func TestInvItemRefFallback(t *testing.T) {
+	// 类名伪造时应回退到注册名，保证卸载能定位
+	if got := (invItem{Name: "/x.ico", Declared: "/x.ico"}).ref(); got != "/x.ico" {
+		t.Errorf("ref() = %q", got)
+	}
+	if got := (invItem{Name: "n", Declared: "d", Class: "c"}).ref(); got != "c" {
+		t.Errorf("ref() 应优先真实类名，得到 %q", got)
+	}
+}
+
 func TestClassifyComponent(t *testing.T) {
 	cases := []struct {
 		name      string

@@ -150,14 +150,74 @@ func disableColor() {
 		"", "", "", "", "", "", "", ""
 }
 
+// ---- 程序横幅（全局仅打印一次）----
+
+const bannerWidth = 70
+
+var bannerPrinted bool
+
+// PrintBanner 打印程序横幅。整个进程只会输出一次，重复调用无副作用。
+func PrintBanner(w *os.File) {
+	if bannerPrinted {
+		return
+	}
+	bannerPrinted = true
+
+	line := func(s string) {
+		pad := bannerWidth - 2 - displayWidth(s)
+		if pad < 0 {
+			pad = 0
+		}
+		fmt.Fprintf(w, "%s%s║  %s%s║%s\n", colBold, colCyan, s, strings.Repeat(" ", pad), colReset)
+	}
+	bar := func(l, r string) {
+		fmt.Fprintf(w, "%s%s%s%s%s%s\n", colBold, colCyan, l, strings.Repeat("═", bannerWidth), r, colReset)
+	}
+
+	bar("╔", "╗")
+	line("内存马应急排查自动化工具  MemCheck " + version)
+	line("依据《内存马应急排查手册 v2.0》· 出品: 数据中心")
+	bar("╚", "╝")
+}
+
+// displayWidth 估算字符串终端显示宽度（CJK/全角按 2 列计）。
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		if isWide(r) {
+			w += 2
+		} else {
+			w++
+		}
+	}
+	return w
+}
+
+func isWide(r rune) bool {
+	switch {
+	case r >= 0x1100 && r <= 0x115F, // Hangul Jamo
+		r >= 0x2E80 && r <= 0x303E, // CJK 部首/标点
+		r >= 0x3041 && r <= 0x33FF, // 假名/兼容
+		r >= 0x3400 && r <= 0x4DBF, // CJK 扩展A
+		r >= 0x4E00 && r <= 0x9FFF, // CJK 统一表意
+		r >= 0xA000 && r <= 0xA4CF, // 彝文
+		r >= 0xAC00 && r <= 0xD7A3, // 谚文音节
+		r >= 0xF900 && r <= 0xFAFF, // CJK 兼容表意
+		r >= 0xFE30 && r <= 0xFE6F, // CJK 兼容形式
+		r >= 0xFF00 && r <= 0xFF60, // 全角 ASCII
+		r >= 0xFFE0 && r <= 0xFFE6,
+		r >= 0x20000:
+		return true
+	}
+	return false
+}
+
 // printText 输出人类可读报告
 func (r *Report) printText(w *os.File) {
 	r.sortFindings()
 	c := r.counts()
 
-	fmt.Fprintf(w, "%s%s╔══════════════════════════════════════════════════════════════════════╗%s\n", colBold, colCyan, colReset)
-	fmt.Fprintf(w, "%s%s║   内存马应急排查自动化报告  (MemCheck)  —  只读检测，不做任何删除     ║%s\n", colBold, colCyan, colReset)
-	fmt.Fprintf(w, "%s%s╚══════════════════════════════════════════════════════════════════════╝%s\n", colBold, colCyan, colReset)
+	PrintBanner(w) // 若启动时已打印则自动跳过
 	fmt.Fprintf(w, "主机: %s   开始时间: %s\n", r.Host, r.StartedAt)
 	fmt.Fprintf(w, "统计: %s严重 %d%s  %s高危 %d%s  %s中危 %d%s  %s低危 %d%s  %s信息 %d%s\n\n",
 		colRedBold, c[SevCritical], colReset,

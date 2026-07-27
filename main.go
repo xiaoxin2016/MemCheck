@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-var version = "1.4.0"
+var version = "1.4.1"
 
 func main() {
 	var (
@@ -70,8 +70,13 @@ func main() {
 		StartedAt: time.Now().Format("2006-01-02 15:04:05 -0700"),
 	}
 
+	// 横幅：整个进程只打印一次。
+	// 直接输出到终端时先打印，让横幅位于进度信息之前；输出到文件时留给报告写入文件开头。
 	if !*jsonOut {
-		fmt.Fprintf(os.Stderr, "%s[memcheck]%s 开始排查（只读，不删文件/不杀进程/不重启；默认会 attach JVM 做只读枚举，-no-attach 可关闭）...\n", colCyan, colReset)
+		if *outFile == "" {
+			PrintBanner(out)
+		}
+		progress(*jsonOut, "开始排查（只读；默认 attach JVM 做只读枚举，-no-attach 可关闭）...")
 	}
 
 	cfg := scanConfig{

@@ -124,10 +124,9 @@ func runRemoval(rep *Report, procs []JavaProcess, opt removeOptions) {
 	}
 	defer cleanup()
 
-	if opt.scanOnly {
-		fmt.Fprintf(os.Stderr, "\n%s[memcheck]%s 运行时枚举模式（attach 只读枚举过滤器链，不做任何卸载）\n", colCyan, colReset)
-	} else {
-		fmt.Fprintf(os.Stderr, "\n%s[memcheck]%s 内存马热卸载模式（只在内存移除注册，不改磁盘/不重启）\n", colYellow, colReset)
+	// 卸载会改动运行中的应用，进入前给出一次明确提示（枚举为只读，无需额外提示）
+	if !opt.scanOnly {
+		fmt.Fprintf(os.Stderr, "%s[memcheck]%s 卸载模式：仅在内存移除注册，不改磁盘/不重启\n", colYellow, colReset)
 	}
 
 	for _, p := range procs {

@@ -176,7 +176,7 @@ func PrintBanner(w *os.File) {
 
 	bar("╔", "╗")
 	line("内存马应急排查自动化工具  MemCheck " + version)
-	line("依据《内存马应急排查手册 v2.0》· 出品: 数据中心")
+	line("数据中心")
 	bar("╚", "╝")
 }
 
